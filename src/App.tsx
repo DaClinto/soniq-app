@@ -35,8 +35,24 @@ import {
   AlertCircle,
   Clock,
   Disc3,
-  Globe
+  Globe,
+  LogOut
 } from 'lucide-react';
+import {
+  createUserWithEmailAndPassword,
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  signOut,
+  type User,
+} from 'firebase/auth';
+import {
+  doc,
+  onSnapshot,
+  serverTimestamp,
+  setDoc,
+} from 'firebase/firestore';
+import { auth, db } from './firebase';
+import { deleteTrackAudio, uploadTrackAudio } from './cloudAudio';
 
 // --- DEMO DATASET & SAMPLE LINKS ---
 const SAMPLE_LINKS = [
@@ -64,6 +80,19 @@ const SAMPLE_LINKS = [
 
 const INITIAL_LIBRARY = [];
 const INITIAL_DOWNLOADS = [];
+const INITIAL_SETTINGS = {
+  defaultFormat: 'MP3',
+  defaultQuality: '320 kbps',
+  concurrentDownloads: 2,
+  autoQueuePermitted: false,
+};
+const LEGACY_STORAGE_KEYS = [
+  'soniq_theme',
+  'soniq_library_v2',
+  'soniq_downloads_v2',
+  'soniq_history_v2',
+  'soniq_settings_v2',
+];
 
 const INITIAL_HISTORY = [
   {
@@ -102,142 +131,232 @@ function formatSeconds(secs) {
   return `${m}:${s < 10 ? '0' : ''}${s}`;
 }
 
+function readLegacyAppData() {
+  const savedTheme = localStorage.getItem('soniq_theme');
+  const savedLibrary = localStorage.getItem('soniq_library_v2');
+  const savedDownloads = localStorage.getItem('soniq_downloads_v2');
+  const savedHistory = localStorage.getItem('soniq_history_v2');
+  const savedSettings = localStorage.getItem('soniq_settings_v2');
+
+  return {
+    hasLegacyData: LEGACY_STORAGE_KEYS.some((key) => localStorage.getItem(key) !== null),
+    data: {
+      isDark: savedTheme === 'dark',
+      library: savedLibrary ? JSON.parse(savedLibrary) : INITIAL_LIBRARY,
+      downloads: savedDownloads ? JSON.parse(savedDownloads) : INITIAL_DOWNLOADS,
+      history: savedHistory ? JSON.parse(savedHistory) : INITIAL_HISTORY,
+      settings: savedSettings ? JSON.parse(savedSettings) : INITIAL_SETTINGS,
+    },
+  };
+}
+
+function clearLegacyAppData() {
+  LEGACY_STORAGE_KEYS.forEach((key) => localStorage.removeItem(key));
+}
+
 export default function App() {
   // --- NAVIGATION & THEME STATE ---
   const [activePage, setActivePage] = useState('importer');
-  const [isDark, setIsDark] = useState(() => {
-    try {
-      const saved = localStorage.getItem('soniq_theme');
-      return saved ? saved === 'dark' : false; // Defaults to crisp Light editorial aesthetic
-    } catch {
-      return false;
-    }
-  });
+  const [isDark, setIsDark] = useState(false);
 
   // --- PERSISTED APPLICATION DATA ---
-  const [library, setLibrary] = useState(() => {
-    try {
-      const saved = localStorage.getItem('soniq_library_v2');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        return Array.isArray(parsed)
-          ? parsed.filter((t) => !t.previewUrl?.includes('soundhelix.com'))
-          : [];
-      }
-      return [];
-    } catch {
-      return [];
-    }
-  });
+  const [library, setLibrary] = useState(INITIAL_LIBRARY);
+  const [downloads, setDownloads] = useState(INITIAL_DOWNLOADS);
 
-  const [downloads, setDownloads] = useState(() => {
-    try {
-      const saved = localStorage.getItem('soniq_downloads_v2');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        return Array.isArray(parsed)
-          ? parsed.filter((t) => !t.previewUrl?.includes('soundhelix.com'))
-          : [];
-      }
-      return [];
-    } catch {
-      return [];
-    }
-  });
-
-  // Sync real downloaded files from local computer library on mount
-  useEffect(() => {
-    const syncLibrary = () => {
-      fetch('/api/library')
-        .then((res) => res.json())
-        .then((data) => {
-          if (data && data.success && Array.isArray(data.tracks)) {
-            setLibrary((prev) => {
-              const cleanPrev = prev.filter(
-                (t) => !t.previewUrl?.includes('soundhelix.com')
-              );
-              const existingTitles = new Set(cleanPrev.map((t) => t.title));
-              const newTracks = data.tracks.filter(
-                (t) => !existingTitles.has(t.title)
-              );
-              return [...newTracks, ...cleanPrev];
-            });
-          }
-        })
-        .catch(() => {});
-    };
-
-    syncLibrary();
-    const timer = setInterval(syncLibrary, 6000);
-    return () => clearInterval(timer);
-  }, []);
-
-  const [history, setHistory] = useState(() => {
-    try {
-      const saved = localStorage.getItem('soniq_history_v2');
-      return saved ? JSON.parse(saved) : INITIAL_HISTORY;
-    } catch {
-      return INITIAL_HISTORY;
-    }
-  });
-
-  const [settings, setSettings] = useState(() => {
-    try {
-      const saved = localStorage.getItem('soniq_settings_v2');
-      return saved
-        ? JSON.parse(saved)
-        : {
-            defaultFormat: 'MP3',
-            defaultQuality: '320 kbps',
-            concurrentDownloads: 2,
-            autoQueuePermitted: false,
-          };
-    } catch {
-      return {
-        defaultFormat: 'MP3',
-        defaultQuality: '320 kbps',
-        concurrentDownloads: 2,
-        autoQueuePermitted: false,
-      };
-    }
-  });
-
-  // Sync to localStorage
-  useEffect(() => {
-    try {
-      localStorage.setItem('soniq_theme', isDark ? 'dark' : 'light');
-    } catch {}
-  }, [isDark]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem('soniq_library_v2', JSON.stringify(library));
-    } catch {}
-  }, [library]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem('soniq_downloads_v2', JSON.stringify(downloads));
-    } catch {}
-  }, [downloads]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem('soniq_history_v2', JSON.stringify(history));
-    } catch {}
-  }, [history]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem('soniq_settings_v2', JSON.stringify(settings));
-    } catch {}
-  }, [settings]);
+  const [history, setHistory] = useState(INITIAL_HISTORY);
+  const [settings, setSettings] = useState(INITIAL_SETTINGS);
+  const [user, setUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [cloudLoading, setCloudLoading] = useState(true);
+  const [cloudReady, setCloudReady] = useState(false);
+  const [cloudError, setCloudError] = useState('');
+  const [cloudRetry, setCloudRetry] = useState(0);
+  const [authMode, setAuthMode] = useState('signIn');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authError, setAuthError] = useState('');
 
   // --- TOAST NOTIFICATIONS ---
   const [toast, setToast] = useState(null);
   const showToast = (message, type = 'info') => {
     setToast({ message, type });
     setTimeout(() => setToast(null), 3500);
+  };
+
+  useEffect(() => {
+    return onAuthStateChanged(auth, (nextUser) => {
+      setUser(nextUser);
+      setAuthLoading(false);
+      setCloudReady(false);
+      setCloudLoading(Boolean(nextUser));
+      setCloudError('');
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!user) {
+      setCloudReady(false);
+      setCloudLoading(false);
+      return;
+    }
+
+    let active = true;
+    let initializingMissingDocument = false;
+    const stateRef = doc(db, 'users', user.uid, 'appData', 'state');
+    const unsubscribe = onSnapshot(
+      stateRef,
+      async (snapshot) => {
+        if (!active) return;
+        try {
+          if (!snapshot.exists()) {
+            if (initializingMissingDocument) return;
+            initializingMissingDocument = true;
+            const legacy = readLegacyAppData();
+            const legacyLibrary = Array.isArray(legacy.data.library)
+              ? legacy.data.library.filter(
+                  (track) => !track.previewUrl?.includes('soundhelix.com')
+                )
+              : INITIAL_LIBRARY;
+            const migratedLibrary = [];
+            for (const track of legacyLibrary) {
+              if (!track.storagePath && track.previewUrl?.includes('/api/stream')) {
+                const uploaded = await uploadTrackAudio(
+                  user.uid,
+                  track.id,
+                  track.previewUrl
+                );
+                migratedLibrary.push({
+                  ...track,
+                  previewUrl: uploaded.downloadUrl,
+                  storagePath: uploaded.storagePath,
+                });
+              } else {
+                migratedLibrary.push(track);
+              }
+            }
+            const importedData = {
+              ...legacy.data,
+              library: migratedLibrary,
+              downloads: Array.isArray(legacy.data.downloads)
+                ? legacy.data.downloads.filter(
+                    (track) => !track.previewUrl?.includes('soundhelix.com')
+                  )
+                : INITIAL_DOWNLOADS,
+              updatedAt: serverTimestamp(),
+            };
+            await setDoc(stateRef, importedData);
+            if (legacy.hasLegacyData) clearLegacyAppData();
+            return;
+          }
+
+          const data = snapshot.data();
+          const nextLibrary = Array.isArray(data.library) ? data.library : INITIAL_LIBRARY;
+          const nextDownloads = Array.isArray(data.downloads)
+            ? data.downloads
+            : INITIAL_DOWNLOADS;
+          const nextHistory = Array.isArray(data.history) ? data.history : INITIAL_HISTORY;
+          const nextSettings = data.settings || INITIAL_SETTINGS;
+          setIsDark(data.isDark === true);
+          setLibrary((current) =>
+            JSON.stringify(current) === JSON.stringify(nextLibrary) ? current : nextLibrary
+          );
+          setDownloads((current) =>
+            JSON.stringify(current) === JSON.stringify(nextDownloads)
+              ? current
+              : nextDownloads
+          );
+          setHistory((current) =>
+            JSON.stringify(current) === JSON.stringify(nextHistory) ? current : nextHistory
+          );
+          setSettings((current) =>
+            JSON.stringify(current) === JSON.stringify(nextSettings) ? current : nextSettings
+          );
+          setCloudReady(true);
+          setCloudLoading(false);
+          setCloudError('');
+        } catch (error) {
+          console.error('Firebase data load failed:', error);
+          if (active) {
+            setCloudError(error.message || 'Could not load your cloud data.');
+            setCloudLoading(false);
+          }
+        }
+      },
+      (error) => {
+        console.error('Firebase data subscription failed:', error);
+        if (active) {
+          setCloudError(error.message || 'Could not connect to Firestore.');
+          setCloudLoading(false);
+        }
+      }
+    );
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [user, cloudRetry]);
+
+  useEffect(() => {
+    if (!user || !cloudReady) return undefined;
+
+    const stateRef = doc(db, 'users', user.uid, 'appData', 'state');
+    const timer = setTimeout(() => {
+      setDoc(
+        stateRef,
+        {
+          isDark,
+          library,
+          downloads,
+          history,
+          settings,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      )
+        .then(() => setCloudError(''))
+        .catch((error) => {
+          console.error('Firebase data save failed:', error);
+          setCloudError(error.message || 'Could not save your cloud data.');
+        });
+    }, 500);
+
+    return () => clearTimeout(timer);
+  }, [user, cloudReady, isDark, library, downloads, history, settings]);
+
+  const handleAuthSubmit = async (event) => {
+    event.preventDefault();
+    setAuthError('');
+    try {
+      if (authMode === 'signUp') {
+        await createUserWithEmailAndPassword(auth, authEmail.trim(), authPassword);
+      } else {
+        await signInWithEmailAndPassword(auth, authEmail.trim(), authPassword);
+      }
+    } catch (error) {
+      console.error('Firebase authentication failed:', error);
+      const authMessages = {
+        'auth/invalid-credential':
+          'That email and password were not accepted. If this is your first time, choose Create account below; otherwise check your details and try again.',
+        'auth/email-already-in-use':
+          'An account already exists for this email. Switch to Sign in instead.',
+        'auth/weak-password':
+          'Choose a stronger password with at least 6 characters.',
+        'auth/invalid-email':
+          'Enter a valid email address.',
+        'auth/operation-not-allowed':
+          'Email/password sign-in is disabled in Firebase Authentication. Enable the Email/Password provider in the Firebase Console.',
+        'auth/too-many-requests':
+          'Too many attempts. Wait a little while, then try again.',
+        'auth/network-request-failed':
+          'Could not reach Firebase. Check your internet connection and try again.',
+      };
+      setAuthError(
+        authMessages[error.code] ||
+          error.message ||
+          'Authentication failed. Please try again.'
+      );
+    }
   };
 
   // --- LINK IMPORTER STATE ---
@@ -322,6 +441,36 @@ export default function App() {
         audioRef.current.src = resolvedUrl;
         startPlayback(audioRef.current);
       }
+    }
+  };
+
+  const handleRemoveTrack = async (track) => {
+    try {
+      await deleteTrackAudio(track.storagePath);
+      setLibrary((prev) => prev.filter((item) => item.id !== track.id));
+      showToast(`Removed "${track.title}" from library.`, 'info');
+    } catch (error) {
+      console.error('Firebase audio deletion failed:', error);
+      showToast(
+        `Could not remove "${track.title}" from cloud storage: ${error.message || 'unknown error'}`,
+        'error'
+      );
+    }
+  };
+
+  const handleResetCloudData = async () => {
+    try {
+      await Promise.all(library.map((track) => deleteTrackAudio(track.storagePath)));
+      setLibrary(INITIAL_LIBRARY);
+      setDownloads(INITIAL_DOWNLOADS);
+      setHistory(INITIAL_HISTORY);
+      showToast('Cloud library, downloads, and history reset.', 'success');
+    } catch (error) {
+      console.error('Firebase library reset failed:', error);
+      showToast(
+        `Could not reset cloud music: ${error.message || 'unknown error'}`,
+        'error'
+      );
     }
   };
 
@@ -425,8 +574,31 @@ export default function App() {
         const data = await resp.json();
         if (data && data.success) {
           const streamUrl = data.streamUrl;
+          setDownloads((prev) =>
+            prev.map((item) =>
+              item.id === jobId
+                ? { ...item, progress: 10, licence: 'Adding to your local library…' }
+                : item
+            )
+          );
+          if (!user) throw new Error('Sign in before saving audio to your account.');
+          const trackId = `lib-${jobId}`;
+          const uploaded = await uploadTrackAudio(
+            user.uid,
+            trackId,
+            streamUrl,
+            (progress) => {
+              setDownloads((prev) =>
+                prev.map((item) =>
+                  item.id === jobId
+                    ? { ...item, progress: 10 + Math.round(progress * 0.85) }
+                    : item
+                )
+              );
+            }
+          );
           const completedTrack = {
-            id: `lib-${jobId}`,
+            id: trackId,
             title: data.title,
             artist: data.artist,
             album: data.album || 'Music_Downloads',
@@ -436,9 +608,10 @@ export default function App() {
             format: data.format || format,
             quality: data.quality || quality,
             size: data.size,
-            previewUrl: streamUrl,
+            previewUrl: uploaded.downloadUrl,
+            storagePath: uploaded.storagePath,
             sourceProvider: 'YouTube Audio (pytubefix)',
-            licence: `Saved locally: ${data.file_path}`,
+            licence: 'Saved to your local library',
             addedAt: new Date().toISOString().split('T')[0],
           };
 
@@ -453,8 +626,9 @@ export default function App() {
                     status: 'completed',
                     progress: 100,
                     size: data.size,
-                    previewUrl: streamUrl,
-                    licence: `Saved to ${data.file_path}`,
+                    previewUrl: uploaded.downloadUrl,
+                    storagePath: uploaded.storagePath,
+                    licence: 'Saved to your local library',
                   }
                 : item
             )
@@ -482,7 +656,7 @@ export default function App() {
               action: 'MP3 Download Completed (pytubefix)',
               title: data.title,
               provider: 'YouTube Audio',
-              url: data.file_path,
+              url: data.url || query,
               status: 'permitted',
             },
             ...prev,
@@ -493,13 +667,13 @@ export default function App() {
             if (prev && (prev.title === data.title || prev.sourceUrl === query)) {
               return {
                 ...prev,
-                previewUrl: streamUrl,
+                previewUrl: uploaded.downloadUrl,
               };
             }
             return prev;
           });
 
-          showToast(`Saved to C:\\Users\\ClintTm\\Music_Downloads\\${data.filename}`, 'success');
+          showToast(`"${data.title}" saved to your local library.`, 'success');
           return;
         }
       }
@@ -510,7 +684,12 @@ export default function App() {
       setDownloads((prev) =>
         prev.map((item) =>
           item.id === jobId
-            ? { ...item, status: 'error', progress: 0, licence: 'Download failed - check server' }
+            ? {
+                ...item,
+                status: 'error',
+                progress: 0,
+                licence: err.message || 'Download failed',
+              }
             : item
         )
       );
@@ -666,6 +845,129 @@ export default function App() {
   const bgSurface = isDark ? 'bg-[#1C1C1F] border-[#2C2C30]' : 'bg-[#FFFFFF] border-[#E5E5EA]';
   const bgSubtle = isDark ? 'bg-[#242428]' : 'bg-[#F5F5F7]';
   const textMuted = isDark ? 'text-[#98989F]' : 'text-[#8E8E93]';
+
+  if (authLoading) {
+    return (
+      <main className="min-h-screen flex items-center justify-center bg-[#F5F5F7] text-[#171719]">
+        <p className="text-sm font-semibold">Connecting to Firebase...</p>
+      </main>
+    );
+  }
+
+  if (!user) {
+    return (
+      <main className="min-h-screen flex items-center justify-center bg-[#F5F5F7] px-4 py-10 text-[#171719]">
+        <form
+          onSubmit={handleAuthSubmit}
+          className="w-full max-w-md rounded-3xl border border-[#E5E5EA] bg-white p-8 shadow-xl space-y-6"
+        >
+          <div className="text-center space-y-2">
+            <div className="mx-auto w-12 h-12 rounded-2xl bg-[#E84159] text-white flex items-center justify-center">
+              <Disc3 className="w-6 h-6" />
+            </div>
+            <h1 className="text-2xl font-bold tracking-tight">SONIQ</h1>
+            <p className="text-sm text-[#8E8E93]">
+              {authMode === 'signUp' ? 'Create an account to save your library.' : 'Sign in to your cloud library.'}
+            </p>
+          </div>
+
+          <label className="block space-y-2">
+            <span className="text-xs font-bold">Email</span>
+            <input
+              type="email"
+              autoComplete="email"
+              required
+              value={authEmail}
+              onChange={(event) => setAuthEmail(event.target.value)}
+              className="w-full rounded-xl border border-[#E5E5EA] bg-[#F5F5F7] px-4 py-3 text-sm outline-none focus:border-[#E84159]"
+              placeholder="you@example.com"
+            />
+          </label>
+
+          <label className="block space-y-2">
+            <span className="text-xs font-bold">Password</span>
+            <input
+              type="password"
+              autoComplete={authMode === 'signUp' ? 'new-password' : 'current-password'}
+              minLength={6}
+              required
+              value={authPassword}
+              onChange={(event) => setAuthPassword(event.target.value)}
+              className="w-full rounded-xl border border-[#E5E5EA] bg-[#F5F5F7] px-4 py-3 text-sm outline-none focus:border-[#E84159]"
+              placeholder="At least 6 characters"
+            />
+          </label>
+
+          {authError && (
+            <p role="alert" className="rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700">
+              {authError}
+            </p>
+          )}
+
+          <button
+            type="submit"
+            className="w-full rounded-xl bg-[#E84159] px-4 py-3 text-sm font-bold text-white hover:opacity-90"
+          >
+            {authMode === 'signUp' ? 'Create account' : 'Sign in'}
+          </button>
+
+          <p className="text-center text-sm text-[#8E8E93]">
+            {authMode === 'signUp' ? 'Already have an account?' : 'New to SONIQ?'}{' '}
+            <button
+              type="button"
+              onClick={() => {
+                setAuthMode(authMode === 'signUp' ? 'signIn' : 'signUp');
+                setAuthError('');
+              }}
+              className="font-bold text-[#E84159]"
+            >
+              {authMode === 'signUp' ? 'Sign in' : 'Create account'}
+            </button>
+          </p>
+        </form>
+      </main>
+    );
+  }
+
+  if (cloudLoading) {
+    return (
+      <main className="min-h-screen flex items-center justify-center bg-[#F5F5F7] text-[#171719]">
+        <p className="text-sm font-semibold">Loading your Firebase library...</p>
+      </main>
+    );
+  }
+
+  if (cloudError && !cloudReady) {
+    return (
+      <main className="min-h-screen flex items-center justify-center bg-[#F5F5F7] px-4 py-10 text-[#171719]">
+        <div className="w-full max-w-lg rounded-3xl border border-[#E5E5EA] bg-white p-8 shadow-xl space-y-5">
+          <h1 className="text-xl font-bold">Could not load cloud data</h1>
+          <p role="alert" className="text-sm text-red-700">{cloudError}</p>
+          <p className="text-sm text-[#8E8E93]">
+            Check that Firestore is enabled and the rules in <code>firestore.rules</code> are published.
+          </p>
+          <div className="flex gap-3">
+            <button
+              onClick={() => {
+                setCloudError('');
+                setCloudLoading(true);
+                setCloudRetry((retry) => retry + 1);
+              }}
+              className="flex-1 rounded-xl bg-[#E84159] px-4 py-3 text-sm font-bold text-white"
+            >
+              Retry
+            </button>
+            <button
+              onClick={() => signOut(auth).catch((error) => setCloudError(error.message))}
+              className="rounded-xl border border-[#E5E5EA] px-4 py-3 text-sm font-bold"
+            >
+              Sign out
+            </button>
+          </div>
+        </div>
+      </main>
+    );
+  }
 
   return (
     <div className={`${bgPrimary} min-h-screen flex flex-col font-sans transition-colors duration-200 selection:bg-[#E84159] selection:text-white`}>
@@ -835,11 +1137,30 @@ export default function App() {
               >
                 {isDark ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4" />}
               </button>
+              <span className="hidden lg:inline max-w-40 truncate text-xs text-[#8E8E93]" title={user.email || ''}>
+                {user.email}
+              </span>
+              <button
+                onClick={() => signOut(auth).catch((error) => {
+                  console.error('Firebase sign-out failed:', error);
+                  setCloudError(error.message || 'Could not sign out.');
+                })}
+                aria-label="Sign out"
+                title="Sign out"
+                className={`p-2.5 rounded-xl border ${bgSurface} hover:border-[#E84159] transition-colors`}
+              >
+                <LogOut className="w-4 h-4" />
+              </button>
             </div>
           </header>
 
           {/* PAGE CONTENT ROUTER */}
           <main className="flex-1 px-4 sm:px-8 py-8 max-w-5xl mx-auto w-full">
+            {cloudError && cloudReady && (
+              <div role="alert" className="mb-5 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                Cloud sync failed: {cloudError}
+              </div>
+            )}
             {/* ============================================================== */}
             {/* 1. LINK IMPORTER PAGE (PRIMARY DEFAULT LANDING VIEW)           */}
             {/* ============================================================== */}
@@ -1555,10 +1876,7 @@ export default function App() {
                               {track.sourceProvider}
                             </span>
                             <button
-                              onClick={() => {
-                                setLibrary((prev) => prev.filter((t) => t.id !== track.id));
-                                showToast(`Removed "${track.title}" from library.`, 'info');
-                              }}
+                              onClick={() => handleRemoveTrack(track)}
                               title="Remove from Library"
                               className={`p-1.5 rounded-lg ${textMuted} hover:text-[#E84159] transition-colors`}
                             >
@@ -1614,10 +1932,7 @@ export default function App() {
                                 )}
                               </button>
                               <button
-                                onClick={() => {
-                                  setLibrary((prev) => prev.filter((t) => t.id !== track.id));
-                                  showToast(`Removed "${track.title}" from library.`, 'info');
-                                }}
+                                onClick={() => handleRemoveTrack(track)}
                                 className={`p-2 rounded-xl ${textMuted} hover:text-[#E84159]`}
                               >
                                 <Trash2 className="w-4 h-4" />
@@ -1856,40 +2171,19 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Local Storage & Reset */}
+                {/* Firebase Cloud Sync & Reset */}
                 <div className={`p-6 rounded-3xl border ${bgSurface} space-y-4`}>
                   <h3 className="font-bold text-base flex items-center gap-2">
                     <HardDrive className="w-4 h-4 text-[#E84159]" />
-                    <span>Local Prototype Storage</span>
+                    <span>Firebase Cloud Sync</span>
                   </h3>
-
-                  <div className="space-y-2">
-                    <div className="flex justify-between text-xs font-semibold">
-                      <span>Estimated Library Footprint ({library.length} tracks)</span>
-                      <span>{(library.length * 42.4).toFixed(1)} MB / 5.0 GB</span>
-                    </div>
-                    <div className={`w-full h-2 rounded-full overflow-hidden ${bgSubtle}`}>
-                      <div
-                        className="h-full bg-[#E84159] rounded-full"
-                        style={{ width: `${Math.min((library.length / 40) * 100, 100)}%` }}
-                      />
-                    </div>
-                  </div>
 
                   <div className="pt-2 flex flex-wrap items-center justify-between gap-3">
                     <p className={`text-xs ${textMuted}`}>
-                      Reset local prototype data back to default demo tracks and queues.
+                      Your library, downloads, history, and settings sync to your account. Audio files are kept in your local Music_Downloads folder.
                     </p>
                     <button
-                      onClick={() => {
-                        setLibrary(INITIAL_LIBRARY);
-                        setDownloads(INITIAL_DOWNLOADS);
-                        setHistory(INITIAL_HISTORY);
-                        localStorage.removeItem('soniq_library_v2');
-                        localStorage.removeItem('soniq_downloads_v2');
-                        localStorage.removeItem('soniq_history_v2');
-                        showToast('Demo library, downloads, and history restored.', 'success');
-                      }}
+                      onClick={handleResetCloudData}
                       className="px-4 py-2 rounded-xl border border-[#E84159] text-[#E84159] text-xs font-bold hover:bg-[#E84159] hover:text-white transition-colors"
                     >
                       Reset Demo Data
