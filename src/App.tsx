@@ -54,6 +54,21 @@ import {
 import { auth, db } from './firebase';
 import { deleteTrackAudio, uploadTrackAudio } from './cloudAudio';
 
+const SONIQ_API_URL = (import.meta.env.VITE_SONIQ_API_URL || '').replace(/\/$/, '');
+
+function apiUrl(path) {
+  if (SONIQ_API_URL) return `${SONIQ_API_URL}${path}`;
+  if (import.meta.env.PROD) {
+    throw new Error('Search and download require VITE_SONIQ_API_URL to point to a running Soniq API server.');
+  }
+  return path;
+}
+
+function resolveApiUrl(url) {
+  if (!url || !url.startsWith('/')) return url;
+  return SONIQ_API_URL ? `${SONIQ_API_URL}${url}` : url;
+}
+
 // --- DEMO DATASET & SAMPLE LINKS ---
 const SAMPLE_LINKS = [
   {
@@ -562,7 +577,7 @@ export default function App() {
 
     try {
       const query = meta.url || meta.sourceUrl || meta.title;
-      const resp = await fetch('/api/download', {
+      const resp = await fetch(apiUrl('/api/download'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query }),
@@ -573,7 +588,7 @@ export default function App() {
       if (resp.ok) {
         const data = await resp.json();
         if (data && data.success) {
-          const streamUrl = data.streamUrl;
+          const streamUrl = resolveApiUrl(data.streamUrl);
           setDownloads((prev) =>
             prev.map((item) =>
               item.id === jobId
@@ -708,7 +723,7 @@ export default function App() {
     setAnalysisResult(null);
 
     try {
-      const resp = await fetch('/api/search', {
+      const resp = await fetch(apiUrl('/api/search'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: trimmed }),
@@ -718,7 +733,7 @@ export default function App() {
         const body = await resp.json();
         if (body && body.success && body.data) {
           const d = body.data;
-          const livePreviewUrl = d.previewUrl || null;
+          const livePreviewUrl = resolveApiUrl(d.previewUrl) || null;
 
           const resultObj = {
             permissionStatus: 'permitted',
