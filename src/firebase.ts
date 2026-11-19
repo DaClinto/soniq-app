@@ -22,15 +22,20 @@ const requiredConfig = [
 
 const missingConfig = requiredConfig.filter((key) => !firebaseConfig[key]);
 
-if (missingConfig.length > 0) {
-  throw new Error(
-    `Missing Firebase configuration: ${missingConfig
+export const firebaseConfigurationError = missingConfig.length > 0
+  ? `Missing Firebase configuration: ${missingConfig
       .map((key) => `VITE_FIREBASE_${key.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase()}`)
       .join(', ')}`
-  );
-}
+  : '';
 
-export const firebaseApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
-export const auth = getAuth(firebaseApp);
-export const db = getFirestore(firebaseApp);
-export const storage = getStorage(firebaseApp);
+export const firebaseApp = firebaseConfigurationError
+  ? null
+  : getApps().length ? getApp() : initializeApp(firebaseConfig);
+export const auth = firebaseApp ? getAuth(firebaseApp) : null;
+export const db = firebaseApp ? getFirestore(firebaseApp) : null;
+export const storage = firebaseApp ? getStorage(firebaseApp) : null;
+
+/*
+  The exports above are intentionally initialized only after checking required
+  configuration. App components must handle firebaseConfigurationError.
+*/
