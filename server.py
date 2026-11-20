@@ -14,7 +14,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import imageio_ffmpeg
 from pytubefix import YouTube, Search
 
-PORT = 5001
+PORT = int(os.environ.get("PORT", "5001"))
 DOWNLOAD_FOLDER = os.path.join(os.path.expanduser("~"), "Music_Downloads")
 CACHE_FOLDER = os.path.join(tempfile.gettempdir(), "soniq-audio-cache")
 CONVERSION_LOCK = threading.Lock()
