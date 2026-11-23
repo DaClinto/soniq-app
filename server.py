@@ -313,6 +313,28 @@ def download_audio(song_query, download_folder=DOWNLOAD_FOLDER, audio_format="MP
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+def ytdlp_download_preview(video_id, out_path):
+    temp_dir = tempfile.mkdtemp(prefix="soniq-prev-")
+    try:
+        opts = dict(YDL_BASE_OPTS)
+        opts.update({
+            "format": "bestaudio/best",
+            "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
+            "skip_download": False,
+            "download_sections": [{"start_time": 0, "end_time": 30}],
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
+        })
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        for name in os.listdir(temp_dir):
+            if name.startswith(f"{video_id}.") and name.endswith(".mp3"):
+                shutil.move(os.path.join(temp_dir, name), out_path)
+                return
+        raise RuntimeError("Preview clip not produced")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def scan_local_library():
     tracks = []
     if not os.path.exists(DOWNLOAD_FOLDER):
@@ -465,22 +487,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     with CONVERSION_LOCK:
                         if not os.path.exists(preview_path):
                             print(f"[Preview] Preparing playable audio for video id: {video_id}")
-                            temp_dir = tempfile.mkdtemp(prefix="soniq-preview-")
-                            try:
-                                source_path = ytdlp_download_source(
-                                    f"https://www.youtube.com/watch?v={video_id}",
-                                    temp_dir,
-                                    video_id,
-                                )
-                                temporary_path = f"{preview_path}.{uuid.uuid4().hex}.tmp.mp3"
-                                try:
-                                    convert_to_mp3(source_path, temporary_path)
-                                    os.replace(temporary_path, preview_path)
-                                finally:
-                                    if os.path.exists(temporary_path):
-                                        os.remove(temporary_path)
-                            finally:
-                                shutil.rmtree(temp_dir, ignore_errors=True)
+                            ytdlp_download_preview(video_id, preview_path)
 
                 self._serve_audio_file(preview_path, head_only)
                 return
