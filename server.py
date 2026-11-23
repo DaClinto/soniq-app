@@ -145,6 +145,7 @@ def get_youtube_info(query):
     query = query.strip()
     if not query:
         return None
+    get_youtube_info.last_error = ""
     try:
         if "youtube.com" in query or "youtu.be" in query:
             video = YouTube(query)
@@ -184,6 +185,7 @@ def get_youtube_info(query):
             }
         }
     except Exception as e:
+        get_youtube_info.last_error = f"{type(e).__name__}: {e}"
         print(f"[Error] Metadata extraction failed: {e}")
         return None
 
@@ -516,7 +518,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self._send_cors()
                 self.end_headers()
-                self.wfile.write(json.dumps({"success": False, "error": "No results or search failed"}).encode("utf-8"))
+                self.wfile.write(json.dumps({"success": False, "error": "No results or search failed", "detail": getattr(get_youtube_info, "last_error", "")}).encode("utf-8"))
             return
 
         self.send_error(404, "Endpoint Not Found")
@@ -545,7 +547,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self._send_cors()
                 self.end_headers()
-                self.wfile.write(json.dumps({"success": False, "error": "No results or search failed"}).encode("utf-8"))
+                self.wfile.write(json.dumps({"success": False, "error": "No results or search failed", "detail": getattr(get_youtube_info, "last_error", "")}).encode("utf-8"))
             return
 
         elif parsed.path == "/api/download":
