@@ -217,6 +217,22 @@ export default function App() {
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
   const [authError, setAuthError] = useState('');
+  const [guestMode, setGuestMode] = useState(
+    () =>
+      typeof window !== 'undefined' &&
+      (new URLSearchParams(window.location.search).has('guest') ||
+        sessionStorage.getItem('soniq-guest') === '1')
+  );
+
+  const enterGuestMode = () => {
+    sessionStorage.setItem('soniq-guest', '1');
+    setGuestMode(true);
+  };
+
+  const exitGuestMode = () => {
+    sessionStorage.removeItem('soniq-guest');
+    setGuestMode(false);
+  };
 
   // --- TOAST NOTIFICATIONS ---
   const [toast, setToast] = useState(null);
@@ -1005,7 +1021,7 @@ export default function App() {
   const bgSubtle = isDark ? 'bg-[#242428]' : 'bg-[#F5F5F7]';
   const textMuted = isDark ? 'text-[#98989F]' : 'text-[#8E8E93]';
 
-  if (authLoading) {
+  if (authLoading && !guestMode) {
     return (
       <main className="min-h-screen flex items-center justify-center bg-[#F5F5F7] text-[#171719]">
         <p className="text-sm font-semibold">Connecting to Supabase...</p>
@@ -1013,7 +1029,7 @@ export default function App() {
     );
   }
 
-  if (!user) {
+  if (!user && !guestMode) {
     return (
       <main className="min-h-screen flex items-center justify-center bg-[#F5F5F7] px-4 py-10 text-[#171719]">
         <form
@@ -1068,6 +1084,14 @@ export default function App() {
             className="w-full rounded-xl bg-[#E84159] px-4 py-3 text-sm font-bold text-white hover:opacity-90"
           >
             {authMode === 'signUp' ? 'Create account' : 'Sign in'}
+          </button>
+
+          <button
+            type="button"
+            onClick={enterGuestMode}
+            className="w-full rounded-xl border border-[#E5E5EA] bg-[#F5F5F7] px-4 py-3 text-sm font-bold text-[#171719] hover:border-[#E84159] transition-colors"
+          >
+            Continue as guest
           </button>
 
           <p className="text-center text-sm text-[#8E8E93]">
@@ -1307,16 +1331,22 @@ export default function App() {
               >
                 {isDark ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4" />}
               </button>
-              <span className="hidden lg:inline max-w-40 truncate text-xs text-[#8E8E93]" title={user.email || ''}>
-                {user.email}
+              <span className="hidden lg:inline max-w-40 truncate text-xs text-[#8E8E93]" title={user?.email || 'Guest session'}>
+                {user?.email || 'Guest'}
               </span>
               <button
-                onClick={() => supabase.auth.signOut().catch((error) => {
-                  console.error('Supabase sign-out failed:', error);
-                  setCloudError(error.message || 'Could not sign out.');
-                })}
-                aria-label="Sign out"
-                title="Sign out"
+                onClick={() => {
+                  if (guestMode && !user) {
+                    exitGuestMode();
+                    return;
+                  }
+                  supabase.auth.signOut().catch((error) => {
+                    console.error('Supabase sign-out failed:', error);
+                    setCloudError(error.message || 'Could not sign out.');
+                  });
+                }}
+                aria-label={guestMode && !user ? 'Exit guest mode' : 'Sign out'}
+                title={guestMode && !user ? 'Exit guest mode' : 'Sign out'}
                 className={`p-2.5 rounded-xl border ${bgSurface} hover:border-[#E84159] transition-colors`}
               >
                 <LogOut className="w-4 h-4" />
