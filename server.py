@@ -4,6 +4,7 @@ import json
 import hashlib
 import mimetypes
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -12,7 +13,7 @@ import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import imageio_ffmpeg
-from pytubefix import YouTube, Search
+import yt_dlp
 
 PORT = int(os.environ.get("PORT", "5001"))
 DOWNLOAD_FOLDER = os.path.join(os.path.expanduser("~"), "Music_Downloads")
@@ -141,131 +142,173 @@ def get_playable_audio_path(file_path):
                     os.remove(temporary_path)
     return cached_path
 
+YDL_BASE_OPTS = {
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "skip_download": True,
+    "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
+}
+
+DEFAULT_THUMB = "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=400&q=80"
+
+
+def ytdlp_extract_info(query):
+    is_url = "youtube.com" in query or "youtu.be" in query
+    opts = dict(YDL_BASE_OPTS)
+    opts["extract_flat"] = not is_url
+    opts["default_search"] = "ytsearch5"
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        if is_url:
+            return ydl.extract_info(query, download=False), None
+        result = ydl.extract_info(f"ytsearch5:{query} Audio", download=False)
+    entries = (result or {}).get("entries") or []
+    for entry in entries:
+        if entry and entry.get("id"):
+            return entry, None
+    return None, "No results found"
+
+
+def ytdlp_thumbnail(info):
+    thumb = ""
+    for t in info.get("thumbnails") or []:
+        url = t.get("url") if isinstance(t, dict) else None
+        if url:
+            thumb = url
+    return thumb or DEFAULT_THUMB
+
+
+def build_youtube_track_info(info, query):
+    video_id = info.get("id") or ""
+    length = int(info.get("duration") or 210)
+    author = info.get("uploader") or info.get("channel") or info.get("artist") or "YouTube Artist"
+    title = info.get("title") or "YouTube Audio Track"
+    watch_url = info.get("webpage_url") or (f"https://www.youtube.com/watch?v={video_id}" if video_id else query)
+    return {
+        "title": title,
+        "artist": author,
+        "album": "YouTube Audio",
+        "duration": f"{length // 60}:{length % 60:02d}",
+        "durationSeconds": length,
+        "artwork": ytdlp_thumbnail(info),
+        "videoId": video_id,
+        "url": watch_url,
+        "provider": "YouTube Audio Engine (yt-dlp)",
+        "licence": "YouTube Audio Stream",
+        "format": "MP3",
+        "quality": "320 kbps",
+        "previewUrl": f"/api/preview_stream?v={video_id}" if video_id else None,
+        "estimatedSizes": {
+            "MP3": f"{(length * 320 / 8 / 1024 / 1024):.1f} MB" if length else "8.4 MB",
+            "FLAC": f"{(length * 900 / 8 / 1024 / 1024):.1f} MB" if length else "34.2 MB",
+            "WAV": f"{(length * 1411 / 8 / 1024 / 1024):.1f} MB" if length else "52.1 MB",
+            "AAC": f"{(length * 256 / 8 / 1024 / 1024):.1f} MB" if length else "7.8 MB",
+        },
+    }
+
+
 def get_youtube_info(query):
-    query = query.strip()
+    query = (query or "").strip()
     if not query:
         return None
     get_youtube_info.last_error = ""
     try:
-        if "youtube.com" in query or "youtu.be" in query:
-            video = YouTube(query)
-            video_id = video.video_id
-        else:
-            search = Search(query + " Audio")
-            if not search.results:
-                return None
-            video = search.results[0]
-            video_id = getattr(video, 'video_id', '')
-
-        title = video.title or "YouTube Audio Track"
-        author = getattr(video, 'author', 'YouTube Artist') or 'YouTube Artist'
-        length = getattr(video, 'length', 210) or 210
-        thumb = getattr(video, 'thumbnail_url', "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=400&q=80")
-        watch_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else query
-
-        return {
-            "title": title,
-            "artist": author,
-            "album": "YouTube Audio",
-            "duration": f"{length // 60}:{length % 60:02d}",
-            "durationSeconds": length,
-            "artwork": thumb,
-            "videoId": video_id,
-            "url": watch_url,
-            "provider": "YouTube Audio Engine (pytubefix)",
-            "licence": "YouTube Audio Stream",
-            "format": "MP3",
-            "quality": "320 kbps",
-            "previewUrl": f"/api/preview_stream?v={video_id}" if video_id else None,
-            "estimatedSizes": {
-                "MP3": f"{(length * 320 / 8 / 1024 / 1024):.1f} MB" if length else "8.4 MB",
-                "FLAC": f"{(length * 900 / 8 / 1024 / 1024):.1f} MB" if length else "34.2 MB",
-                "WAV": f"{(length * 1411 / 8 / 1024 / 1024):.1f} MB" if length else "52.1 MB",
-                "AAC": f"{(length * 256 / 8 / 1024 / 1024):.1f} MB" if length else "7.8 MB",
-            }
-        }
+        info, err = ytdlp_extract_info(query)
+        if not info:
+            get_youtube_info.last_error = err or "No results found"
+            return None
+        return build_youtube_track_info(info, query)
     except Exception as e:
         get_youtube_info.last_error = f"{type(e).__name__}: {e}"
         print(f"[Error] Metadata extraction failed: {e}")
         return None
 
+def ytdlp_download_source(url, out_dir, video_id=""):
+    os.makedirs(out_dir, exist_ok=True)
+    opts = dict(YDL_BASE_OPTS)
+    opts.update({
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(out_dir, "%(id)s.%(ext)s"),
+        "skip_download": False,
+    })
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+    prefix = f"{video_id}." if video_id else ""
+    for name in sorted(os.listdir(out_dir)):
+        if name.startswith(prefix) and not name.endswith((".part", ".ytdl", ".tmp")):
+            return os.path.join(out_dir, name)
+    raise RuntimeError("yt-dlp did not produce an audio file")
+
+
 def download_audio(song_query, download_folder=DOWNLOAD_FOLDER, audio_format="MP3", quality="320kbps"):
     print(f"\n[Download] Request received for: {song_query} ({audio_format}/{quality})")
-    if not os.path.exists(download_folder):
-        os.makedirs(download_folder, exist_ok=True)
+    os.makedirs(download_folder, exist_ok=True)
+    temp_dir = None
     try:
-        if "youtube.com" in song_query or "youtu.be" in song_query:
-            video = YouTube(song_query)
-        else:
-            search = Search(song_query + " Audio")
-            if not search.results:
-                print(f"[Download] No results found for query: {song_query}")
-                return None
-            video = search.results[0]
-
-        print(f"[Download] Selected video: {video.title}")
-        audio_stream = video.streams.get_audio_only()
-        if not audio_stream:
-            print(f"[Download] No audio stream found for {video.title}")
+        info, err = ytdlp_extract_info(song_query)
+        if not info:
+            print(f"[Download] No results for query: {song_query} ({err})")
             return None
 
+        video_id = info.get("id") or ""
+        title = info.get("title") or "YouTube Audio Track"
+        watch_url = info.get("webpage_url") or (f"https://www.youtube.com/watch?v={video_id}" if video_id else song_query)
         requested_format = normalize_audio_format(audio_format)
         requested_quality = quality or "320kbps"
         output_extension, _ = audio_output_settings(requested_format, requested_quality)
-        safe_title = sanitize_filename(video.title)
+        safe_title = sanitize_filename(title)
         filename = f"{safe_title}.{output_extension}"
         file_path = os.path.join(download_folder, filename)
-        source_extension = audio_file_extension(audio_stream)
-        source_filename = f".soniq-{uuid.uuid4().hex}.{source_extension}"
-        source_path = os.path.join(download_folder, source_filename)
         temporary_output_path = os.path.join(
             download_folder, f".soniq-out-{uuid.uuid4().hex}.{output_extension}"
         )
 
-        print(f"[Download] Downloading stream to: {file_path}")
-        audio_stream.download(output_path=download_folder, filename=source_filename)
+        temp_dir = tempfile.mkdtemp(prefix="soniq-dl-")
+        source_path = ytdlp_download_source(watch_url, temp_dir, video_id)
+        print(f"[Download] Converting to {requested_format}/{requested_quality}: {file_path}")
         try:
             convert_audio(source_path, temporary_output_path, requested_format, requested_quality)
             os.replace(temporary_output_path, file_path)
         finally:
-            if os.path.exists(source_path):
-                os.remove(source_path)
             if os.path.exists(temporary_output_path):
                 os.remove(temporary_output_path)
         print(f"[Download] Successfully saved: {file_path}")
 
         file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
         size_mb = f"{file_size / (1024 * 1024):.1f} MB"
-        length = getattr(video, 'length', 210) or 210
-        thumb = getattr(video, 'thumbnail_url', "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=400&q=80")
-        author = getattr(video, 'author', 'YouTube Artist') or 'YouTube Artist'
+        meta = build_youtube_track_info(info, song_query)
         display_quality = requested_quality if requested_quality else (
             "Lossless" if requested_format == "FLAC" else "CD Quality" if requested_format == "WAV" else "320 kbps"
         )
+        stream_url = f"/api/stream?file={urllib.parse.quote(filename)}"
 
         return {
             "success": True,
             "id": f"yt-{abs(hash(filename))}",
-            "title": video.title,
-            "artist": author,
+            "title": title,
+            "artist": meta["artist"],
             "album": "YouTube Audio Master",
-            "duration": f"{length // 60}:{length % 60:02d}",
-            "durationSeconds": length,
-            "artwork": thumb,
+            "duration": meta["duration"],
+            "durationSeconds": meta["durationSeconds"],
+            "artwork": meta["artwork"],
             "filename": filename,
             "file_path": file_path,
             "size": size_mb,
             "sizeBytes": file_size,
             "format": requested_format,
             "quality": display_quality,
-            "provider": "YouTube Audio (pytubefix)",
+            "provider": "YouTube Audio (yt-dlp)",
             "licence": "Downloaded to your browser",
-            "streamUrl": f"/api/stream?file={urllib.parse.quote(filename)}",
-            "downloadUrl": f"/api/download_file?file={urllib.parse.quote(filename)}"
+            "streamUrl": stream_url,
+            "downloadUrl": f"/api/download_file?file={urllib.parse.quote(filename)}",
+            "previewUrl": stream_url,
         }
     except Exception as e:
         print(f"[Download Error] {e}")
         return None
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 def scan_local_library():
     tracks = []
@@ -280,7 +323,7 @@ def scan_local_library():
             tracks.append({
                 "id": f"local-{abs(hash(f))}",
                 "title": name_no_ext,
-                "artist": "Local Audio / pytubefix",
+                "artist": "Local Audio / yt-dlp",
                 "album": "Music_Downloads",
                 "artwork": "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=400&q=80",
                 "duration": "Audio File",
@@ -384,7 +427,7 @@ class APIHandler(BaseHTTPRequestHandler):
             if not head_only:
                 self.wfile.write(json.dumps({
                     "status": "online",
-                    "engine": "pytubefix",
+                    "engine": "yt-dlp",
                     "folder": DOWNLOAD_FOLDER
                 }).encode("utf-8"))
             return
@@ -413,41 +456,24 @@ class APIHandler(BaseHTTPRequestHandler):
                     with CONVERSION_LOCK:
                         if not os.path.exists(preview_path):
                             print(f"[Preview] Preparing playable audio for video id: {video_id}")
-                            stream = YouTube(
-                                f"https://www.youtube.com/watch?v={video_id}"
-                            ).streams.get_audio_only()
-                            if not stream:
-                                self.send_error(404, "No audio stream found")
-                                return
-
-                            extension = audio_file_extension(stream)
-                            source_path = os.path.join(
-                                CACHE_FOLDER, f".preview-{uuid.uuid4().hex}.{extension}"
-                            )
+                            temp_dir = tempfile.mkdtemp(prefix="soniq-preview-")
                             try:
-                                stream.download(
-                                    output_path=CACHE_FOLDER,
-                                    filename=os.path.basename(source_path)
+                                source_path = ytdlp_download_source(
+                                    f"https://www.youtube.com/watch?v={video_id}",
+                                    temp_dir,
+                                    video_id,
                                 )
-                                if extension == "mp3":
-                                    os.replace(source_path, preview_path)
-                                else:
-                                    temporary_path = (
-                                        f"{preview_path}.{uuid.uuid4().hex}.tmp.mp3"
-                                    )
-                                    try:
-                                        convert_to_mp3(source_path, temporary_path)
-                                        os.replace(temporary_path, preview_path)
-                                    finally:
-                                        if os.path.exists(temporary_path):
-                                            os.remove(temporary_path)
+                                temporary_path = f"{preview_path}.{uuid.uuid4().hex}.tmp.mp3"
+                                try:
+                                    convert_to_mp3(source_path, temporary_path)
+                                    os.replace(temporary_path, preview_path)
+                                finally:
+                                    if os.path.exists(temporary_path):
+                                        os.remove(temporary_path)
                             finally:
-                                if os.path.exists(source_path):
-                                    os.remove(source_path)
+                                shutil.rmtree(temp_dir, ignore_errors=True)
 
                 self._serve_audio_file(preview_path, head_only)
-                return
-            except ConnectionError:
                 return
             except Exception as e:
                 print(f"[Preview Error] {e}")
