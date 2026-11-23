@@ -3,10 +3,82 @@
 @tailwind utilities;
 
 @layer base {
+  html {
+    scroll-behavior: smooth;
+  }
   body {
     margin: 0;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
+  ::selection {
+    background: rgba(232, 65, 89, 0.35);
+    color: inherit;
+  }
+  :focus-visible {
+    outline: 2px solid #E84159;
+    outline-offset: 2px;
+  }
+}
+
+/* SONIQ UI polish */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(142, 142, 147, 0.45);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(232, 65, 89, 0.65);
+  background-clip: padding-box;
+}
+
+.glass {
+  background: rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+}
+
+.card-hover {
+  transition: transform 0.25s ease, box-shadow 0.25s ease, border-color 0.25s ease;
+}
+.card-hover:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 18px 42px -20px rgba(0, 0, 0, 0.75);
+}
+
+.soniq-eq {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 18px;
+}
+.soniq-eq span {
+  width: 3px;
+  height: 30%;
+  border-radius: 2px;
+  background: #E84159;
+  animation: soniq-eq 1s ease-in-out infinite;
+}
+.soniq-eq span:nth-child(2) { animation-delay: 0.15s; }
+.soniq-eq span:nth-child(3) { animation-delay: 0.3s; }
+.soniq-eq span:nth-child(4) { animation-delay: 0.45s; }
+@keyframes soniq-eq {
+  0%, 100% { height: 30%; }
+  50% { height: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .soniq-eq span { animation: none; }
+  .card-hover:hover { transform: none; }
 }
