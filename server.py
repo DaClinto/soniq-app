@@ -92,7 +92,7 @@ def audio_output_settings(audio_format, quality):
     return "mp3", ["-codec:a", "libmp3lame", "-b:a", audio_bitrate(audio_format, quality)]
 
 
-def convert_audio(source_path, output_path, audio_format="MP3", quality="320kbps"):
+def convert_audio(source_path, output_path, audio_format="MP3", quality="320kbps", cover_path=None):
     extension, codec_args = audio_output_settings(audio_format, quality)
     command = [
         imageio_ffmpeg.get_ffmpeg_exe(),
@@ -101,10 +101,23 @@ def convert_audio(source_path, output_path, audio_format="MP3", quality="320kbps
         "-nostdin",
         "-y",
         "-i", source_path,
-        "-vn",
-        *codec_args,
-        output_path,
     ]
+    if cover_path and os.path.exists(cover_path) and extension != "wav":
+        command += ["-i", cover_path, "-map", "0:a:0", "-map", "1:v:0"]
+        if extension == "mp3":
+            command += [
+                "-c:v", "mjpeg",
+                "-id3v2_version", "3",
+                "-metadata:s:v", "title=Album cover",
+                "-metadata:s:v", "comment=Cover (front)",
+            ]
+        elif extension == "flac":
+            command += ["-c:v", "copy", "-disposition:v", "attached_pic"]
+        else:
+            command += ["-c:v", "mjpeg", "-disposition:v", "attached_pic"]
+    else:
+        command += ["-vn"]
+    command += [*codec_args, output_path]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
         if os.path.exists(output_path):
@@ -267,9 +280,20 @@ def download_audio(song_query, download_folder=DOWNLOAD_FOLDER, audio_format="MP
 
         temp_dir = tempfile.mkdtemp(prefix="soniq-dl-")
         source_path = ytdlp_download_source(watch_url, temp_dir, video_id)
+        cover_path = None
+        thumb_url = ytdlp_thumbnail(info)
+        if thumb_url and "unsplash" not in thumb_url:
+            cover_path = os.path.join(temp_dir, "cover.jpg")
+            try:
+                req = urllib.request.Request(thumb_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=20) as resp, open(cover_path, "wb") as cover_file:
+                    cover_file.write(resp.read())
+            except Exception as cover_error:
+                print(f"[Cover] Artwork download failed: {cover_error}")
+                cover_path = None
         print(f"[Download] Converting to {requested_format}/{requested_quality}: {file_path}")
         try:
-            convert_audio(source_path, temporary_output_path, requested_format, requested_quality)
+            convert_audio(source_path, temporary_output_path, requested_format, requested_quality, cover_path)
             os.replace(temporary_output_path, file_path)
         finally:
             if os.path.exists(temporary_output_path):
