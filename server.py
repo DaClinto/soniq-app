@@ -42,6 +42,8 @@ def audio_content_type(file_path):
         return "audio/wav"
     if header.startswith(b"OggS"):
         return "audio/ogg"
+    if header.startswith(b"fLaC"):
+        return "audio/flac"
     return mimetypes.guess_type(file_path)[0] or "application/octet-stream"
 
 def audio_file_extension(stream):
@@ -55,7 +57,42 @@ def audio_file_extension(stream):
         return subtype
     raise ValueError(f"Unsupported audio stream type: {mime_type or subtype or 'unknown'}")
 
-def convert_to_mp3(source_path, output_path):
+def normalize_audio_format(audio_format):
+    normalized = (audio_format or "MP3").strip().upper()
+    if normalized == "AAC":
+        return "AAC"
+    if normalized == "WAV":
+        return "WAV"
+    if normalized == "FLAC":
+        return "FLAC"
+    return "MP3"
+
+
+def audio_bitrate(audio_format, quality):
+    quality_text = (quality or "").lower()
+    for bitrate in ("320", "256", "192", "128"):
+        if bitrate in quality_text:
+            return f"{bitrate}k"
+    return "256k" if audio_format == "AAC" else "320k"
+
+
+def audio_output_settings(audio_format, quality):
+    if audio_format == "WAV":
+        codec = "pcm_s24le" if "24" in (quality or "") else "pcm_s16le"
+        return "wav", ["-codec:a", codec]
+    if audio_format == "FLAC":
+        return "flac", ["-codec:a", "flac", "-compression_level", "8"]
+    if audio_format == "AAC":
+        return "m4a", [
+            "-codec:a", "aac",
+            "-b:a", audio_bitrate(audio_format, quality),
+            "-movflags", "+faststart",
+        ]
+    return "mp3", ["-codec:a", "libmp3lame", "-b:a", audio_bitrate(audio_format, quality)]
+
+
+def convert_audio(source_path, output_path, audio_format="MP3", quality="320kbps"):
+    extension, codec_args = audio_output_settings(audio_format, quality)
     command = [
         imageio_ffmpeg.get_ffmpeg_exe(),
         "-hide_banner",
@@ -64,8 +101,7 @@ def convert_to_mp3(source_path, output_path):
         "-y",
         "-i", source_path,
         "-vn",
-        "-codec:a", "libmp3lame",
-        "-b:a", "320k",
+        *codec_args,
         output_path,
     ]
     result = subprocess.run(command, capture_output=True, text=True)
@@ -74,7 +110,12 @@ def convert_to_mp3(source_path, output_path):
             os.remove(output_path)
         raise RuntimeError(f"Audio conversion failed: {result.stderr.strip()[-1000:]}")
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-        raise RuntimeError("Audio conversion produced an empty MP3 file")
+        raise RuntimeError("Audio conversion produced an empty file")
+    return extension
+
+
+def convert_to_mp3(source_path, output_path):
+    convert_audio(source_path, output_path, "MP3", "320kbps")
 
 def get_playable_audio_path(file_path):
     if audio_content_type(file_path) != "audio/mp4":
@@ -146,8 +187,8 @@ def get_youtube_info(query):
         print(f"[Error] Metadata extraction failed: {e}")
         return None
 
-def download_audio(song_query, download_folder=DOWNLOAD_FOLDER):
-    print(f"\n[Download] Request received for: {song_query}")
+def download_audio(song_query, download_folder=DOWNLOAD_FOLDER, audio_format="MP3", quality="320kbps"):
+    print(f"\n[Download] Request received for: {song_query} ({audio_format}/{quality})")
     if not os.path.exists(download_folder):
         os.makedirs(download_folder, exist_ok=True)
     try:
@@ -166,23 +207,29 @@ def download_audio(song_query, download_folder=DOWNLOAD_FOLDER):
             print(f"[Download] No audio stream found for {video.title}")
             return None
 
+        requested_format = normalize_audio_format(audio_format)
+        requested_quality = quality or "320kbps"
+        output_extension, _ = audio_output_settings(requested_format, requested_quality)
         safe_title = sanitize_filename(video.title)
-        extension = audio_file_extension(audio_stream)
-        filename = f"{safe_title}.mp3"
+        filename = f"{safe_title}.{output_extension}"
         file_path = os.path.join(download_folder, filename)
-        source_filename = f".soniq-{uuid.uuid4().hex}.{extension}"
+        source_extension = audio_file_extension(audio_stream)
+        source_filename = f".soniq-{uuid.uuid4().hex}.{source_extension}"
         source_path = os.path.join(download_folder, source_filename)
+        temporary_output_path = os.path.join(
+            download_folder, f".soniq-out-{uuid.uuid4().hex}.{output_extension}"
+        )
 
         print(f"[Download] Downloading stream to: {file_path}")
         audio_stream.download(output_path=download_folder, filename=source_filename)
         try:
-            if extension == "mp3":
-                os.replace(source_path, file_path)
-            else:
-                convert_to_mp3(source_path, file_path)
+            convert_audio(source_path, temporary_output_path, requested_format, requested_quality)
+            os.replace(temporary_output_path, file_path)
         finally:
             if os.path.exists(source_path):
                 os.remove(source_path)
+            if os.path.exists(temporary_output_path):
+                os.remove(temporary_output_path)
         print(f"[Download] Successfully saved: {file_path}")
 
         file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
@@ -190,6 +237,9 @@ def download_audio(song_query, download_folder=DOWNLOAD_FOLDER):
         length = getattr(video, 'length', 210) or 210
         thumb = getattr(video, 'thumbnail_url', "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=400&q=80")
         author = getattr(video, 'author', 'YouTube Artist') or 'YouTube Artist'
+        display_quality = requested_quality if requested_quality else (
+            "Lossless" if requested_format == "FLAC" else "CD Quality" if requested_format == "WAV" else "320 kbps"
+        )
 
         return {
             "success": True,
@@ -203,11 +253,13 @@ def download_audio(song_query, download_folder=DOWNLOAD_FOLDER):
             "filename": filename,
             "file_path": file_path,
             "size": size_mb,
-            "format": "MP3",
-            "quality": "320 kbps",
+            "sizeBytes": file_size,
+            "format": requested_format,
+            "quality": display_quality,
             "provider": "YouTube Audio (pytubefix)",
-            "licence": "Saved locally to Music_Downloads",
-            "streamUrl": f"/api/stream?file={urllib.parse.quote(filename)}"
+            "licence": "Downloaded to your browser",
+            "streamUrl": f"/api/stream?file={urllib.parse.quote(filename)}",
+            "downloadUrl": f"/api/download_file?file={urllib.parse.quote(filename)}"
         }
     except Exception as e:
         print(f"[Download Error] {e}")
@@ -218,10 +270,11 @@ def scan_local_library():
     if not os.path.exists(DOWNLOAD_FOLDER):
         return tracks
     for f in os.listdir(DOWNLOAD_FOLDER):
-        if f.lower().endswith(('.mp3', '.m4a', '.wav', '.webm', '.ogg', '.aac')):
+        if f.lower().endswith(('.mp3', '.m4a', '.wav', '.flac', '.webm', '.ogg', '.aac')):
             p = os.path.join(DOWNLOAD_FOLDER, f)
             size_mb = f"{os.path.getsize(p) / (1024*1024):.1f} MB"
             name_no_ext = os.path.splitext(f)[0]
+            extension = os.path.splitext(f)[1][1:].upper()
             tracks.append({
                 "id": f"local-{abs(hash(f))}",
                 "title": name_no_ext,
@@ -230,7 +283,7 @@ def scan_local_library():
                 "artwork": "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=400&q=80",
                 "duration": "Audio File",
                 "durationSeconds": 240,
-                "format": os.path.splitext(f)[1][1:].upper(),
+                "format": "AAC" if extension == "M4A" else extension,
                 "quality": "320 kbps",
                 "size": size_mb,
                 "previewUrl": f"/api/stream?file={urllib.parse.quote(f)}",
@@ -402,13 +455,34 @@ class APIHandler(BaseHTTPRequestHandler):
                     pass
                 return
 
-        elif parsed.path == "/api/stream":
+        elif parsed.path == "/api/download_file":
             params = urllib.parse.parse_qs(parsed.query)
-            filename = params.get("file", [None])[0]
+            filename = os.path.basename(params.get("file", [None])[0] or "")
             if not filename:
                 self.send_error(400, "Missing filename")
                 return
-            file_path = os.path.join(DOWNLOAD_FOLDER, filename)
+            file_path = os.path.realpath(os.path.join(DOWNLOAD_FOLDER, filename))
+            download_root = os.path.realpath(DOWNLOAD_FOLDER)
+            if not file_path.startswith(download_root + os.sep):
+                self.send_error(400, "Invalid filename")
+                return
+            if not os.path.exists(file_path):
+                self.send_error(404, f"File not found: {filename}")
+                return
+            self._serve_audio_file(file_path, head_only)
+            return
+
+        elif parsed.path == "/api/stream":
+            params = urllib.parse.parse_qs(parsed.query)
+            filename = os.path.basename(params.get("file", [None])[0] or "")
+            if not filename:
+                self.send_error(400, "Missing filename")
+                return
+            file_path = os.path.realpath(os.path.join(DOWNLOAD_FOLDER, filename))
+            download_root = os.path.realpath(DOWNLOAD_FOLDER)
+            if not file_path.startswith(download_root + os.sep):
+                self.send_error(400, "Invalid filename")
+                return
             if not os.path.exists(file_path):
                 self.send_error(404, f"File not found: {filename}")
                 return
@@ -454,7 +528,12 @@ class APIHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/api/download":
             query = data.get("query", "")
-            res = download_audio(query, DOWNLOAD_FOLDER)
+            res = download_audio(
+                query,
+                DOWNLOAD_FOLDER,
+                data.get("format", "MP3"),
+                data.get("quality", "320kbps"),
+            )
             if res:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")

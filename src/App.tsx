@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {
   Link2,
+  Download,
   DownloadCloud,
   Music2,
   History,
@@ -38,21 +39,15 @@ import {
   Globe,
   LogOut
 } from 'lucide-react';
-import {
-  createUserWithEmailAndPassword,
-  onAuthStateChanged,
-  signInWithEmailAndPassword,
-  signOut,
-  type User,
-} from 'firebase/auth';
-import {
-  doc,
-  onSnapshot,
-  serverTimestamp,
-  setDoc,
-} from 'firebase/firestore';
-import { auth, db } from './firebase';
+import { supabase } from './supabase';
 import { deleteTrackAudio, uploadTrackAudio } from './cloudAudio';
+import {
+  downloadBlobToDevice,
+  fetchAudioBlob,
+  sanitizeDownloadFilename,
+} from './audioDownload';
+
+type AuthUser = { id: string; email?: string | null };
 
 const SONIQ_API_URL = (import.meta.env.VITE_SONIQ_API_URL || '').replace(/\/$/, '');
 
@@ -67,6 +62,38 @@ function apiUrl(path) {
 function resolveApiUrl(url) {
   if (!url || !url.startsWith('/')) return url;
   return SONIQ_API_URL ? `${SONIQ_API_URL}${url}` : url;
+}
+
+const OUTPUT_FORMATS = ['MP3', 'AAC', 'WAV', 'FLAC'];
+
+const OUTPUT_QUALITY_OPTIONS = {
+  MP3: [
+    { value: '128 kbps', label: '128 kbps (Compact)' },
+    { value: '192 kbps', label: '192 kbps (Balanced)' },
+    { value: '320 kbps', label: '320 kbps (High Quality)' },
+  ],
+  AAC: [
+    { value: '128 kbps', label: '128 kbps (Compact)' },
+    { value: '256 kbps', label: '256 kbps (Balanced)' },
+    { value: '320 kbps', label: '320 kbps (High Quality)' },
+  ],
+  WAV: [
+    { value: '16-bit 44.1 kHz', label: '16-bit / 44.1 kHz (CD)' },
+    { value: '24-bit 48 kHz', label: '24-bit / 48 kHz (Studio)' },
+  ],
+  FLAC: [
+    { value: 'FLAC level 5', label: 'FLAC Level 5 (Fast)' },
+    { value: 'FLAC level 8', label: 'FLAC Level 8 (Smallest)' },
+  ],
+};
+
+function defaultQualityForFormat(format) {
+  return OUTPUT_QUALITY_OPTIONS[format]?.[0]?.value || '320 kbps';
+}
+
+function formatBytes(bytes) {
+  if (!bytes || Number.isNaN(bytes)) return '0 MB';
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 // --- DEMO DATASET & SAMPLE LINKS ---
@@ -180,7 +207,7 @@ export default function App() {
 
   const [history, setHistory] = useState(INITIAL_HISTORY);
   const [settings, setSettings] = useState(INITIAL_SETTINGS);
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUser] = useState<AuthUser | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [cloudLoading, setCloudLoading] = useState(true);
   const [cloudReady, setCloudReady] = useState(false);
@@ -199,13 +226,21 @@ export default function App() {
   };
 
   useEffect(() => {
-    return onAuthStateChanged(auth, (nextUser) => {
+    if (!supabase) {
+      setAuthLoading(false);
+      return;
+    }
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      const nextUser = session?.user
+        ? { id: session.user.id, email: session.user.email ?? null }
+        : null;
       setUser(nextUser);
       setAuthLoading(false);
       setCloudReady(false);
       setCloudLoading(Boolean(nextUser));
       setCloudError('');
     });
+    return () => subscription.unsubscribe();
   }, []);
 
   useEffect(() => {
@@ -214,125 +249,133 @@ export default function App() {
       setCloudLoading(false);
       return;
     }
+    if (!supabase) {
+      setCloudError('Supabase is not configured.');
+      setCloudLoading(false);
+      return;
+    }
 
     let active = true;
-    let initializingMissingDocument = false;
-    const stateRef = doc(db, 'users', user.uid, 'appData', 'state');
-    const unsubscribe = onSnapshot(
-      stateRef,
-      async (snapshot) => {
-        if (!active) return;
-        try {
-          if (!snapshot.exists()) {
-            if (initializingMissingDocument) return;
-            initializingMissingDocument = true;
-            const legacy = readLegacyAppData();
-            const legacyLibrary = Array.isArray(legacy.data.library)
-              ? legacy.data.library.filter(
+    const loadCloudState = async () => {
+      try {
+        const { data, error } = await supabase
+          .from('app_state')
+          .select('data')
+          .eq('user_id', user.id)
+          .maybeSingle();
+        if (error) throw error;
+
+        if (!data) {
+          const legacy = readLegacyAppData();
+          const legacyLibrary = Array.isArray(legacy.data.library)
+            ? legacy.data.library.filter(
+                (track) => !track.previewUrl?.includes('soundhelix.com')
+              )
+            : INITIAL_LIBRARY;
+          const migratedLibrary = [];
+          for (const track of legacyLibrary) {
+            if (!track.storagePath && track.previewUrl?.includes('/api/stream')) {
+              const uploaded = await uploadTrackAudio(
+                user.id,
+                track.id,
+                resolveApiUrl(track.previewUrl)
+              );
+              migratedLibrary.push({
+                ...track,
+                previewUrl: uploaded.downloadUrl,
+                storagePath: uploaded.storagePath,
+              });
+            } else {
+              migratedLibrary.push(track);
+            }
+          }
+          const importedData = {
+            ...legacy.data,
+            library: migratedLibrary,
+            downloads: Array.isArray(legacy.data.downloads)
+              ? legacy.data.downloads.filter(
                   (track) => !track.previewUrl?.includes('soundhelix.com')
                 )
-              : INITIAL_LIBRARY;
-            const migratedLibrary = [];
-            for (const track of legacyLibrary) {
-              if (!track.storagePath && track.previewUrl?.includes('/api/stream')) {
-                const uploaded = await uploadTrackAudio(
-                  user.uid,
-                  track.id,
-                  track.previewUrl
-                );
-                migratedLibrary.push({
-                  ...track,
-                  previewUrl: uploaded.downloadUrl,
-                  storagePath: uploaded.storagePath,
-                });
-              } else {
-                migratedLibrary.push(track);
-              }
-            }
-            const importedData = {
-              ...legacy.data,
-              library: migratedLibrary,
-              downloads: Array.isArray(legacy.data.downloads)
-                ? legacy.data.downloads.filter(
-                    (track) => !track.previewUrl?.includes('soundhelix.com')
-                  )
-                : INITIAL_DOWNLOADS,
-              updatedAt: serverTimestamp(),
-            };
-            await setDoc(stateRef, importedData);
-            if (legacy.hasLegacyData) clearLegacyAppData();
-            return;
-          }
-
-          const data = snapshot.data();
-          const nextLibrary = Array.isArray(data.library) ? data.library : INITIAL_LIBRARY;
-          const nextDownloads = Array.isArray(data.downloads)
-            ? data.downloads
-            : INITIAL_DOWNLOADS;
-          const nextHistory = Array.isArray(data.history) ? data.history : INITIAL_HISTORY;
-          const nextSettings = data.settings || INITIAL_SETTINGS;
-          setIsDark(data.isDark === true);
-          setLibrary((current) =>
-            JSON.stringify(current) === JSON.stringify(nextLibrary) ? current : nextLibrary
-          );
-          setDownloads((current) =>
-            JSON.stringify(current) === JSON.stringify(nextDownloads)
-              ? current
-              : nextDownloads
-          );
-          setHistory((current) =>
-            JSON.stringify(current) === JSON.stringify(nextHistory) ? current : nextHistory
-          );
-          setSettings((current) =>
-            JSON.stringify(current) === JSON.stringify(nextSettings) ? current : nextSettings
-          );
+              : INITIAL_DOWNLOADS,
+          };
+          const { error: upsertError } = await supabase
+            .from('app_state')
+            .upsert({ user_id: user.id, data: importedData }, { onConflict: 'user_id' });
+          if (upsertError) throw upsertError;
+          if (legacy.hasLegacyData) clearLegacyAppData();
+          if (!active) return;
+          setIsDark(importedData.isDark === true);
+          setLibrary(migratedLibrary);
+          setDownloads(importedData.downloads);
+          setHistory(importedData.history);
+          setSettings(importedData.settings);
           setCloudReady(true);
           setCloudLoading(false);
           setCloudError('');
-        } catch (error) {
-          console.error('Firebase data load failed:', error);
-          if (active) {
-            setCloudError(error.message || 'Could not load your cloud data.');
-            setCloudLoading(false);
-          }
+          return;
         }
-      },
-      (error) => {
-        console.error('Firebase data subscription failed:', error);
+
+        const appData = data.data || {};
+        const nextLibrary = Array.isArray(appData.library) ? appData.library : INITIAL_LIBRARY;
+        const nextDownloads = Array.isArray(appData.downloads)
+          ? appData.downloads
+          : INITIAL_DOWNLOADS;
+        const nextHistory = Array.isArray(appData.history) ? appData.history : INITIAL_HISTORY;
+        const nextSettings = appData.settings || INITIAL_SETTINGS;
+        if (!active) return;
+        setIsDark(appData.isDark === true);
+        setLibrary((current) =>
+          JSON.stringify(current) === JSON.stringify(nextLibrary) ? current : nextLibrary
+        );
+        setDownloads((current) =>
+          JSON.stringify(current) === JSON.stringify(nextDownloads)
+            ? current
+            : nextDownloads
+        );
+        setHistory((current) =>
+          JSON.stringify(current) === JSON.stringify(nextHistory) ? current : nextHistory
+        );
+        setSettings((current) =>
+          JSON.stringify(current) === JSON.stringify(nextSettings) ? current : nextSettings
+        );
+        setCloudReady(true);
+        setCloudLoading(false);
+        setCloudError('');
+      } catch (error) {
+        console.error('Supabase data load failed:', error);
         if (active) {
-          setCloudError(error.message || 'Could not connect to Firestore.');
+          setCloudError(error.message || 'Could not load your cloud data.');
           setCloudLoading(false);
         }
       }
-    );
+    };
 
+    loadCloudState();
     return () => {
       active = false;
-      unsubscribe();
     };
   }, [user, cloudRetry]);
 
   useEffect(() => {
-    if (!user || !cloudReady) return undefined;
+    if (!user || !cloudReady || !supabase) return undefined;
 
-    const stateRef = doc(db, 'users', user.uid, 'appData', 'state');
     const timer = setTimeout(() => {
-      setDoc(
-        stateRef,
-        {
-          isDark,
-          library,
-          downloads,
-          history,
-          settings,
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      )
-        .then(() => setCloudError(''))
-        .catch((error) => {
-          console.error('Firebase data save failed:', error);
-          setCloudError(error.message || 'Could not save your cloud data.');
+      supabase
+        .from('app_state')
+        .upsert(
+          {
+            user_id: user.id,
+            data: { isDark, library, downloads, history, settings },
+          },
+          { onConflict: 'user_id' }
+        )
+        .then(({ error }) => {
+          if (error) {
+            console.error('Supabase data save failed:', error);
+            setCloudError(error.message || 'Could not save your cloud data.');
+          } else {
+            setCloudError('');
+          }
         });
     }, 500);
 
@@ -341,30 +384,52 @@ export default function App() {
 
   const handleAuthSubmit = async (event) => {
     event.preventDefault();
+    if (!supabase) {
+      setAuthError('Supabase is not configured.');
+      return;
+    }
     setAuthError('');
     try {
       if (authMode === 'signUp') {
-        await createUserWithEmailAndPassword(auth, authEmail.trim(), authPassword);
+        const { data, error } = await supabase.auth.signUp({
+          email: authEmail.trim(),
+          password: authPassword,
+        });
+        if (error) throw error;
+        if (!data.session) {
+          setAuthMode('signIn');
+          showToast('Account created. Confirm your email, then sign in.', 'info');
+        }
       } else {
-        await signInWithEmailAndPassword(auth, authEmail.trim(), authPassword);
+        const { error } = await supabase.auth.signInWithPassword({
+          email: authEmail.trim(),
+          password: authPassword,
+        });
+        if (error) throw error;
       }
     } catch (error) {
-      console.error('Firebase authentication failed:', error);
+      console.error('Supabase authentication failed:', error);
       const authMessages = {
-        'auth/invalid-credential':
+        invalid_credentials:
           'That email and password were not accepted. If this is your first time, choose Create account below; otherwise check your details and try again.',
-        'auth/email-already-in-use':
+        email_exists:
           'An account already exists for this email. Switch to Sign in instead.',
-        'auth/weak-password':
+        user_already_exists:
+          'An account already exists for this email. Switch to Sign in instead.',
+        weak_password:
           'Choose a stronger password with at least 6 characters.',
-        'auth/invalid-email':
+        invalid_email:
           'Enter a valid email address.',
-        'auth/operation-not-allowed':
-          'Email/password sign-in is disabled in Firebase Authentication. Enable the Email/Password provider in the Firebase Console.',
-        'auth/too-many-requests':
+        over_request_rate_limit:
           'Too many attempts. Wait a little while, then try again.',
-        'auth/network-request-failed':
-          'Could not reach Firebase. Check your internet connection and try again.',
+        over_email_send_rate_limit:
+          'Too many email attempts. Wait a while, or disable email confirmation in Supabase Auth settings for development.',
+        email_rate_limit_exceeded:
+          'Too many email attempts. Wait a while, or disable email confirmation in Supabase Auth settings for development.',
+        email_not_confirmed:
+          'Confirm your email address before signing in.',
+        signup_disabled:
+          'Sign-up is disabled for this Supabase project.',
       };
       setAuthError(
         authMessages[error.code] ||
@@ -394,6 +459,8 @@ export default function App() {
   const audioRef = useRef(null);
   const [currentTrack, setCurrentTrack] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackLoading, setPlaybackLoading] = useState(false);
+  const [savingTrackIds, setSavingTrackIds] = useState([]);
   const [currentTime, setCurrentTime] = useState(0);
   const [audioDuration, setAudioDuration] = useState(0);
   const [volume, setVolume] = useState(80);
@@ -413,6 +480,7 @@ export default function App() {
       if (error.name === 'AbortError') return;
       console.error('Audio playback failed:', error);
       setIsPlaying(false);
+      setPlaybackLoading(false);
       showToast(
         error.name === 'NotAllowedError'
           ? 'Your browser blocked playback. Click Play to try again.'
@@ -431,10 +499,12 @@ export default function App() {
 
     if (audio.paused) {
       setIsPlaying(true);
+      setPlaybackLoading(true);
       startPlayback(audio);
     } else {
       audio.pause();
       setIsPlaying(false);
+      setPlaybackLoading(false);
     }
   };
 
@@ -443,7 +513,7 @@ export default function App() {
       showToast('No playable preview stream available for this item.', 'warning');
       return;
     }
-    const resolvedUrl = track.previewUrl;
+    const resolvedUrl = resolveApiUrl(track.previewUrl);
     const playTrack = { ...track, previewUrl: resolvedUrl };
 
     if (currentTrack?.previewUrl === resolvedUrl) {
@@ -451,11 +521,59 @@ export default function App() {
     } else {
       setCurrentTrack(playTrack);
       setCurrentTime(0);
-      setIsPlaying(true);
+      setAudioDuration(0);
+      setIsPlaying(false);
+      setPlaybackLoading(true);
       if (audioRef.current) {
         audioRef.current.src = resolvedUrl;
         startPlayback(audioRef.current);
       }
+    }
+  };
+
+  const handleSaveTrackToDevice = async (track) => {
+    if (!track || savingTrackIds.includes(track.id)) return;
+
+    const resolvedPreviewUrl = track.previewUrl ? resolveApiUrl(track.previewUrl) : '';
+    const originalFileUrl = resolvedPreviewUrl.includes('/api/stream?')
+      ? resolvedPreviewUrl.replace('/api/stream?', '/api/download_file?')
+      : null;
+    const candidates = [...new Set(
+      [track.downloadUrl, originalFileUrl, track.previewUrl]
+        .filter(Boolean)
+        .map((url) => resolveApiUrl(url))
+    )];
+
+    if (candidates.length === 0) {
+      showToast('No audio stream available to save.', 'warning');
+      return;
+    }
+
+    const extension = track.format?.toLowerCase() === 'aac' ? 'm4a' : (track.format || 'mp3').toLowerCase();
+    const filename = sanitizeDownloadFilename(
+      track.filename || `${track.title}.${extension}`,
+      track.title
+    );
+
+    setSavingTrackIds((prev) => [...prev, track.id]);
+    try {
+      let lastError = null;
+      for (const url of candidates) {
+        try {
+          const { blob } = await fetchAudioBlob(url);
+          downloadBlobToDevice(blob, filename);
+          showToast(`"${track.title}" saved to your browser.`, 'success');
+          return;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      throw lastError || new Error('Audio stream unavailable');
+    } catch (error) {
+      console.error('Browser save failed:', error);
+      showToast(error.message || 'Could not save this track to your browser.', 'error');
+    } finally {
+      setSavingTrackIds((prev) => prev.filter((id) => id !== track.id));
     }
   };
 
@@ -465,7 +583,7 @@ export default function App() {
       setLibrary((prev) => prev.filter((item) => item.id !== track.id));
       showToast(`Removed "${track.title}" from library.`, 'info');
     } catch (error) {
-      console.error('Firebase audio deletion failed:', error);
+      console.error('Supabase audio deletion failed:', error);
       showToast(
         `Could not remove "${track.title}" from cloud storage: ${error.message || 'unknown error'}`,
         'error'
@@ -481,7 +599,7 @@ export default function App() {
       setHistory(INITIAL_HISTORY);
       showToast('Cloud library, downloads, and history reset.', 'success');
     } catch (error) {
-      console.error('Firebase library reset failed:', error);
+      console.error('Supabase library reset failed:', error);
       showToast(
         `Could not reset cloud music: ${error.message || 'unknown error'}`,
         'error'
@@ -541,6 +659,7 @@ export default function App() {
 
   const enqueueAuthorisedDownload = async (meta, format, quality) => {
     const jobId = `dl-${Date.now()}`;
+    const query = meta.url || meta.sourceUrl || meta.query || meta.title;
     const newJob = {
       id: jobId,
       title: meta.title,
@@ -554,162 +673,187 @@ export default function App() {
       durationSeconds: meta.durationSeconds,
       previewUrl: meta.previewUrl,
       status: 'downloading',
-      progress: 20,
+      progress: 5,
       provider: 'YouTube Audio (pytubefix)',
-      licence: 'Downloading to C:\\Users\\ClintTm\\Music_Downloads...',
+      query,
+      licence: 'Preparing audio transfer…',
+    };
+
+    const updateJob = (updates) => {
+      setDownloads((prev) =>
+        prev.map((item) => (item.id === jobId ? { ...item, ...updates } : item))
+      );
     };
 
     setDownloads((prev) => [newJob, ...prev]);
-    showToast(`Downloading "${meta.title}" via pytubefix to your computer...`, 'info');
-
-    // Smoothly increment progress while real python download runs
-    const progressTimer = setInterval(() => {
-      setDownloads((prev) =>
-        prev.map((item) => {
-          if (item.id === jobId && item.status === 'downloading') {
-            const nextP = Math.min(item.progress + 6, 92);
-            return { ...item, progress: nextP };
-          }
-          return item;
-        })
-      );
-    }, 1000);
+    showToast(`Preparing "${meta.title}" for download...`, 'info');
 
     try {
-      const query = meta.url || meta.sourceUrl || meta.title;
       const resp = await fetch(apiUrl('/api/download'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({ query, format, quality }),
       });
 
-      clearInterval(progressTimer);
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok || !body.success) {
+        throw new Error(body.error || `Download failed (${resp.status})`);
+      }
+      const data = body;
 
-      if (resp.ok) {
-        const data = await resp.json();
-        if (data && data.success) {
-          const streamUrl = resolveApiUrl(data.streamUrl);
-          setDownloads((prev) =>
-            prev.map((item) =>
-              item.id === jobId
-                ? { ...item, progress: 10, licence: 'Adding to your local library…' }
-                : item
-            )
-          );
-          if (!user) throw new Error('Sign in before saving audio to your account.');
-          const trackId = `lib-${jobId}`;
+      const streamUrl = resolveApiUrl(data.streamUrl);
+      const downloadUrl = resolveApiUrl(data.downloadUrl || data.streamUrl);
+      const filename = sanitizeDownloadFilename(
+        data.filename || `${data.title}.${format.toLowerCase() === 'aac' ? 'm4a' : format.toLowerCase()}`,
+        data.title
+      );
+
+      updateJob({
+        progress: 15,
+        licence: 'Downloading audio to your browser…',
+      });
+
+      const { blob, contentType } = await fetchAudioBlob(downloadUrl, (progress) => {
+        updateJob({
+          progress: 15 + Math.round(progress * 55),
+          licence: 'Saving audio to your device…',
+        });
+      });
+
+      downloadBlobToDevice(blob, filename);
+
+      const trackId = `lib-${jobId}`;
+      let previewUrl = streamUrl;
+      let storagePath = '';
+      let cloudBackedUp = false;
+
+      if (user) {
+        updateJob({
+          progress: 75,
+          licence: 'Backing up to your cloud library…',
+        });
+        try {
           const uploaded = await uploadTrackAudio(
-            user.uid,
+            user.id,
             trackId,
-            streamUrl,
+            blob,
             (progress) => {
-              setDownloads((prev) =>
-                prev.map((item) =>
-                  item.id === jobId
-                    ? { ...item, progress: 10 + Math.round(progress * 0.85) }
-                    : item
-                )
-              );
-            }
-          );
-          const completedTrack = {
-            id: trackId,
-            title: data.title,
-            artist: data.artist,
-            album: data.album || 'Music_Downloads',
-            artwork: data.artwork || meta.artwork,
-            duration: data.duration,
-            durationSeconds: data.durationSeconds,
-            format: data.format || format,
-            quality: data.quality || quality,
-            size: data.size,
-            previewUrl: uploaded.downloadUrl,
-            storagePath: uploaded.storagePath,
-            sourceProvider: 'YouTube Audio (pytubefix)',
-            licence: 'Saved to your local library',
-            addedAt: new Date().toISOString().split('T')[0],
-          };
-
-          // Mark download complete in Downloads Hub
-          setDownloads((prev) =>
-            prev.map((item) =>
-              item.id === jobId
-                ? {
-                    ...item,
-                    title: data.title,
-                    artist: data.artist,
-                    status: 'completed',
-                    progress: 100,
-                    size: data.size,
-                    previewUrl: uploaded.downloadUrl,
-                    storagePath: uploaded.storagePath,
-                    licence: 'Saved to your local library',
-                  }
-                : item
-            )
-          );
-
-          // Add track to Library
-          setLibrary((prev) => {
-            const clean = prev.filter(
-              (t) => t.title !== data.title && !t.previewUrl?.includes('soundhelix.com')
-            );
-            return [completedTrack, ...clean];
-          });
-
-          // Add to Activity History
-          setHistory((prev) => [
-            {
-              id: `hist-${Date.now()}`,
-              timestamp: new Date().toLocaleString([], {
-                year: 'numeric',
-                month: '2-digit',
-                day: '2-digit',
-                hour: '2-digit',
-                minute: '2-digit',
-              }),
-              action: 'MP3 Download Completed (pytubefix)',
-              title: data.title,
-              provider: 'YouTube Audio',
-              url: data.url || query,
-              status: 'permitted',
+              updateJob({
+                progress: 75 + Math.round(progress * 20),
+                licence: 'Uploading cloud backup…',
+              });
             },
-            ...prev,
-          ]);
-
-          // Update analysis result if this song was just downloaded
-          setAnalysisResult((prev) => {
-            if (prev && (prev.title === data.title || prev.sourceUrl === query)) {
-              return {
-                ...prev,
-                previewUrl: uploaded.downloadUrl,
-              };
-            }
-            return prev;
-          });
-
-          showToast(`"${data.title}" saved to your local library.`, 'success');
-          return;
+            filename,
+            contentType
+          );
+          previewUrl = uploaded.downloadUrl;
+          storagePath = uploaded.storagePath;
+          cloudBackedUp = true;
+        } catch (uploadError) {
+          console.error('Cloud audio backup failed:', uploadError);
+          showToast(
+            `"${data.title}" was saved to your browser, but cloud backup failed.`,
+            'warning'
+          );
         }
       }
-      throw new Error('Server download failed');
-    } catch (err) {
-      clearInterval(progressTimer);
-      console.error('Download error:', err);
-      setDownloads((prev) =>
-        prev.map((item) =>
-          item.id === jobId
-            ? {
-                ...item,
-                status: 'error',
-                progress: 0,
-                licence: err.message || 'Download failed',
-              }
-            : item
-        )
+
+      const completedTrack = {
+        id: trackId,
+        title: data.title,
+        artist: data.artist,
+        album: data.album || 'Music_Downloads',
+        artwork: data.artwork || meta.artwork,
+        duration: data.duration,
+        durationSeconds: data.durationSeconds,
+        format: data.format || format,
+        quality: data.quality || quality,
+        size: formatBytes(blob.size),
+        filename,
+        previewUrl,
+        downloadUrl,
+        storagePath,
+        sourceProvider: 'YouTube Audio (pytubefix)',
+        licence: cloudBackedUp ? 'Saved to browser & cloud library' : 'Saved to browser',
+        addedAt: new Date().toISOString().split('T')[0],
+      };
+
+      updateJob({
+        title: data.title,
+        artist: data.artist,
+        status: 'completed',
+        progress: 100,
+        size: formatBytes(blob.size),
+        filename,
+        previewUrl,
+        downloadUrl,
+        storagePath,
+        licence: cloudBackedUp ? 'Saved to browser & cloud library' : 'Saved to browser',
+      });
+
+      setLibrary((prev) => {
+        const clean = prev.filter(
+          (t) => t.title !== data.title && !t.previewUrl?.includes('soundhelix.com')
+        );
+        return [completedTrack, ...clean];
+      });
+
+      setHistory((prev) => [
+        {
+          id: `hist-${Date.now()}`,
+          timestamp: new Date().toLocaleString([], {
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+          }),
+          action: `${data.format || format} Download Completed`,
+          title: data.title,
+          provider: 'YouTube Audio',
+          url: data.url || query,
+          status: 'permitted',
+        },
+        ...prev,
+      ]);
+
+      setAnalysisResult((prev) => {
+        if (prev && (prev.title === data.title || prev.sourceUrl === query)) {
+          return {
+            ...prev,
+            previewUrl,
+          };
+        }
+        return prev;
+      });
+
+      showToast(
+        cloudBackedUp
+          ? `"${data.title}" downloaded to your browser and cloud library.`
+          : `"${data.title}" downloaded to your browser.`,
+        'success'
       );
-      showToast('Download failed. Ensure Python server is running.', 'error');
+    } catch (err) {
+      console.error('Download error:', err);
+      updateJob({
+        status: 'failed',
+        progress: 0,
+        licence: err.message || 'Download failed',
+      });
+      showToast(
+        err.message || 'Download failed. Check the audio service and try again.',
+        'error'
+      );
     }
+  };
+
+  const retryDownload = (item) => {
+    setDownloads((prev) => prev.filter((download) => download.id !== item.id));
+    enqueueAuthorisedDownload(
+      { ...item, url: item.query || item.title },
+      item.format || 'MP3',
+      item.quality || '320 kbps'
+    );
   };
 
   const runLinkAnalysis = async (targetUrl = urlInput) => {
@@ -864,7 +1008,7 @@ export default function App() {
   if (authLoading) {
     return (
       <main className="min-h-screen flex items-center justify-center bg-[#F5F5F7] text-[#171719]">
-        <p className="text-sm font-semibold">Connecting to Firebase...</p>
+        <p className="text-sm font-semibold">Connecting to Supabase...</p>
       </main>
     );
   }
@@ -947,7 +1091,7 @@ export default function App() {
   if (cloudLoading) {
     return (
       <main className="min-h-screen flex items-center justify-center bg-[#F5F5F7] text-[#171719]">
-        <p className="text-sm font-semibold">Loading your Firebase library...</p>
+        <p className="text-sm font-semibold">Loading your Supabase library...</p>
       </main>
     );
   }
@@ -959,7 +1103,7 @@ export default function App() {
           <h1 className="text-xl font-bold">Could not load cloud data</h1>
           <p role="alert" className="text-sm text-red-700">{cloudError}</p>
           <p className="text-sm text-[#8E8E93]">
-            Check that Firestore is enabled and the rules in <code>firestore.rules</code> are published.
+            Check that the app_state table and storage policies in <code>supabase/schema.sql</code> are applied.
           </p>
           <div className="flex gap-3">
             <button
@@ -973,7 +1117,7 @@ export default function App() {
               Retry
             </button>
             <button
-              onClick={() => signOut(auth).catch((error) => setCloudError(error.message))}
+              onClick={() => supabase.auth.signOut().catch((error) => setCloudError(error.message))}
               className="rounded-xl border border-[#E5E5EA] px-4 py-3 text-sm font-bold"
             >
               Sign out
@@ -989,13 +1133,23 @@ export default function App() {
       {/* Hidden HTML5 Audio Engine */}
       <audio
         ref={audioRef}
+        preload="metadata"
         onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
         onLoadedMetadata={(e) => setAudioDuration(e.currentTarget.duration)}
+        onPlaying={() => {
+          setIsPlaying(true);
+          setPlaybackLoading(false);
+        }}
+        onPause={() => {
+          setIsPlaying(false);
+          setPlaybackLoading(false);
+        }}
         onError={(e) => {
           const error = e.currentTarget.error;
           if (!error) return;
           console.error('Audio element error:', error);
           setIsPlaying(false);
+          setPlaybackLoading(false);
           showToast(
             error.code === MediaError.MEDIA_ERR_DECODE
               ? 'This audio file could not be decoded.'
@@ -1006,6 +1160,7 @@ export default function App() {
         onEnded={() => {
           if (repeatMode === 'one' && audioRef.current) {
             audioRef.current.currentTime = 0;
+            setPlaybackLoading(true);
             startPlayback(audioRef.current);
           } else {
             handleNextTrack();
@@ -1156,8 +1311,8 @@ export default function App() {
                 {user.email}
               </span>
               <button
-                onClick={() => signOut(auth).catch((error) => {
-                  console.error('Firebase sign-out failed:', error);
+                onClick={() => supabase.auth.signOut().catch((error) => {
+                  console.error('Supabase sign-out failed:', error);
                   setCloudError(error.message || 'Could not sign out.');
                 })}
                 aria-label="Sign out"
@@ -1344,17 +1499,22 @@ export default function App() {
                       </label>
                       <select
                         value={selectedFormat}
-                        onChange={(e) => setSelectedFormat(e.target.value)}
+                        onChange={(e) => {
+                          const nextFormat = e.target.value;
+                          setSelectedFormat(nextFormat);
+                          setSelectedQuality(defaultQualityForFormat(nextFormat));
+                        }}
                         className={`w-full px-3.5 py-3 rounded-xl border text-sm font-semibold focus:outline-none focus:ring-2 focus:ring-[#E84159] ${
                           isDark
                             ? 'bg-[#121214] border-[#2C2C30] text-white'
                             : 'bg-[#F5F5F7] border-[#E5E5EA] text-[#171719]'
                         }`}
                       >
-                        <option value="MP3">MP3</option>
-                        <option value="FLAC">FLAC (Lossless)</option>
-                        <option value="WAV">WAV (Uncompressed)</option>
-                        <option value="AAC">AAC</option>
+                        {OUTPUT_FORMATS.map((format) => (
+                          <option key={format} value={format}>
+                            {format === 'AAC' ? 'AAC (M4A)' : format}
+                          </option>
+                        ))}
                       </select>
                     </div>
 
@@ -1371,10 +1531,11 @@ export default function App() {
                             : 'bg-[#F5F5F7] border-[#E5E5EA] text-[#171719]'
                         }`}
                       >
-                        <option value="128kbps">128 kbps (Compact)</option>
-                        <option value="320kbps">320 kbps (High Quality)</option>
-                        <option value="16-Bit 44.1kHz">16-Bit / 44.1 kHz (CD)</option>
-                        <option value="24-Bit 96kHz Lossless">24-Bit / 96 kHz Lossless</option>
+                        {(OUTPUT_QUALITY_OPTIONS[selectedFormat] || OUTPUT_QUALITY_OPTIONS.MP3).map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
                       </select>
                     </div>
 
@@ -1388,15 +1549,18 @@ export default function App() {
                         {analysisState === 'analyzing' ? (
                           <>
                             <Loader2 className="w-5 h-5 animate-spin" />
-                            <span>Verifying & Extracting...</span>
+                            <span>Finding track...</span>
                           </>
                         ) : (
                           <>
-                            <DownloadCloud className="w-5 h-5" />
-                            <span>Analyse & Download</span>
+                            <Search className="w-5 h-5" />
+                            <span>Find Track</span>
                           </>
                         )}
                       </button>
+                      <p className={`mt-2 text-center text-[11px] ${textMuted}`}>
+                        Downloads save a copy to your browser, then back up to your library.
+                      </p>
                     </div>
                   </div>
                 </div>
@@ -1495,7 +1659,7 @@ export default function App() {
                               ) : (
                                 <>
                                   <DownloadCloud className="w-4 h-4" />
-                                  <span>Download</span>
+                                  <span>Download {selectedFormat === 'AAC' ? 'M4A' : selectedFormat}</span>
                                 </>
                               )}
                             </button>
@@ -1550,44 +1714,16 @@ export default function App() {
                     <div className="flex items-center gap-2.5">
                       <h1 className="text-3xl font-bold tracking-tight">Downloads</h1>
                       <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-[#E84159]/10 text-[#E84159]">
-                        Simulated Transfer Queue
+                        Live Download Queue
                       </span>
                     </div>
                     <p className={`text-sm mt-1 ${textMuted}`}>
-                      Completed downloads automatically save into your My Music library.
+                      Files are saved to your browser first, then backed up for playback.
                     </p>
                   </div>
 
-                  {/* Bulk Queue Controls */}
+                  {/* Queue Controls */}
                   <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      onClick={() =>
-                        setDownloads((prev) =>
-                          prev.map((d) =>
-                            d.status === 'paused' || d.status === 'queued'
-                              ? { ...d, status: 'downloading' }
-                              : d
-                          )
-                        )
-                      }
-                      className="px-3.5 py-2 rounded-xl bg-[#E84159] text-white text-xs font-bold flex items-center gap-1.5 shadow-sm"
-                    >
-                      <Play className="w-3.5 h-3.5 fill-current" />
-                      <span>Start All</span>
-                    </button>
-                    <button
-                      onClick={() =>
-                        setDownloads((prev) =>
-                          prev.map((d) =>
-                            d.status === 'downloading' ? { ...d, status: 'paused' } : d
-                          )
-                        )
-                      }
-                      className={`px-3.5 py-2 rounded-xl border text-xs font-bold flex items-center gap-1.5 ${bgSurface}`}
-                    >
-                      <Pause className="w-3.5 h-3.5" />
-                      <span>Pause All</span>
-                    </button>
                     <button
                       onClick={() =>
                         setDownloads((prev) => prev.filter((d) => d.status !== 'completed'))
@@ -1596,6 +1732,15 @@ export default function App() {
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                       <span>Clear Completed</span>
+                    </button>
+                    <button
+                      onClick={() =>
+                        setDownloads((prev) => prev.filter((d) => d.status !== 'failed'))
+                      }
+                      className={`px-3.5 py-2 rounded-xl border text-xs font-bold flex items-center gap-1.5 ${bgSurface} ${textMuted} hover:text-[#E84159]`}
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Clear Failed</span>
                     </button>
                   </div>
                 </div>
@@ -1656,6 +1801,11 @@ export default function App() {
                             <p className={`text-[11px] mt-1 ${textMuted}`}>
                               {item.provider} • {item.format} ({item.quality}) • {item.size}
                             </p>
+                            {item.licence && (
+                              <p className={`text-[11px] mt-1 truncate ${textMuted}`}>
+                                {item.licence}
+                              </p>
+                            )}
                           </div>
                         </div>
 
@@ -1720,29 +1870,34 @@ export default function App() {
                           )}
                           {item.status === 'failed' && (
                             <button
-                              onClick={() =>
-                                setDownloads((prev) =>
-                                  prev.map((d) =>
-                                    d.id === item.id
-                                      ? { ...d, status: 'downloading', progress: 0 }
-                                      : d
-                                  )
-                                )
-                              }
-                              title="Retry"
+                              onClick={() => retryDownload(item)}
+                              title="Retry download"
                               className={`p-2 rounded-xl border ${bgSurface} hover:border-[#E84159]`}
                             >
                               <RotateCcw className="w-4 h-4" />
                             </button>
                           )}
                           {item.status === 'completed' && (
-                            <button
-                              onClick={() => handlePlayTrack(item)}
-                              title="Play Track"
-                              className="p-2 rounded-xl bg-[#E84159] text-white"
-                            >
-                              <Play className="w-4 h-4 fill-current" />
-                            </button>
+                            <>
+                              <button
+                                onClick={() => handleSaveTrackToDevice(item)}
+                                title="Save to browser again"
+                                className={`p-2 rounded-xl border ${bgSurface} hover:border-[#E84159]`}
+                              >
+                                {savingTrackIds.includes(item.id) ? (
+                                  <Loader2 className="w-4 h-4 animate-spin" />
+                                ) : (
+                                  <Download className="w-4 h-4" />
+                                )}
+                              </button>
+                              <button
+                                onClick={() => handlePlayTrack(item)}
+                                title="Play Track"
+                                className="p-2 rounded-xl bg-[#E84159] text-white"
+                              >
+                                <Play className="w-4 h-4 fill-current" />
+                              </button>
+                            </>
                           )}
                           <button
                             onClick={() =>
@@ -1887,16 +2042,29 @@ export default function App() {
                               isDark ? 'border-[#2C2C30]' : 'border-[#E5E5EA]'
                             }`}
                           >
-                            <span className={`truncate max-w-[170px] ${textMuted}`}>
+                            <span className={`truncate max-w-[130px] ${textMuted}`}>
                               {track.sourceProvider}
                             </span>
-                            <button
-                              onClick={() => handleRemoveTrack(track)}
-                              title="Remove from Library"
-                              className={`p-1.5 rounded-lg ${textMuted} hover:text-[#E84159] transition-colors`}
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
+                            <div className="flex items-center gap-1">
+                              <button
+                                onClick={() => handleSaveTrackToDevice(track)}
+                                title="Save to browser"
+                                className={`p-1.5 rounded-lg ${textMuted} hover:text-[#E84159] transition-colors`}
+                              >
+                                {savingTrackIds.includes(track.id) ? (
+                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                ) : (
+                                  <Download className="w-3.5 h-3.5" />
+                                )}
+                              </button>
+                              <button
+                                onClick={() => handleRemoveTrack(track)}
+                                title="Remove from Library"
+                                className={`p-1.5 rounded-lg ${textMuted} hover:text-[#E84159] transition-colors`}
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
                           </div>
                         </div>
                       );
@@ -1947,7 +2115,21 @@ export default function App() {
                                 )}
                               </button>
                               <button
+                                onClick={() => handleSaveTrackToDevice(track)}
+                                title="Save to browser"
+                                className={`w-9 h-9 rounded-full border flex items-center justify-center ${textMuted} hover:text-[#E84159] ${
+                                  isDark ? 'border-[#2C2C30] bg-[#121214]' : 'border-[#E5E5EA] bg-white'
+                                }`}
+                              >
+                                {savingTrackIds.includes(track.id) ? (
+                                  <Loader2 className="w-4 h-4 animate-spin" />
+                                ) : (
+                                  <Download className="w-4 h-4" />
+                                )}
+                              </button>
+                              <button
                                 onClick={() => handleRemoveTrack(track)}
+                                title="Remove from Library"
                                 className={`p-2 rounded-xl ${textMuted} hover:text-[#E84159]`}
                               >
                                 <Trash2 className="w-4 h-4" />
@@ -2124,17 +2306,20 @@ export default function App() {
                         value={settings.defaultFormat}
                         onChange={(e) => {
                           const val = e.target.value;
-                          setSettings({ ...settings, defaultFormat: val });
+                          const nextQuality = defaultQualityForFormat(val);
+                          setSettings({ ...settings, defaultFormat: val, defaultQuality: nextQuality });
                           setSelectedFormat(val);
+                          setSelectedQuality(nextQuality);
                         }}
                         className={`w-full px-3.5 py-2.5 rounded-xl border text-sm font-semibold ${
                           isDark ? 'bg-[#121214] border-[#2C2C30]' : 'bg-[#F5F5F7] border-[#E5E5EA]'
                         }`}
                       >
-                        <option value="MP3">MP3</option>
-                        <option value="FLAC">FLAC (Lossless)</option>
-                        <option value="WAV">WAV</option>
-                        <option value="AAC">AAC</option>
+                        {OUTPUT_FORMATS.map((format) => (
+                          <option key={format} value={format}>
+                            {format === 'AAC' ? 'AAC (M4A)' : format}
+                          </option>
+                        ))}
                       </select>
                     </div>
 
@@ -2151,57 +2336,36 @@ export default function App() {
                           isDark ? 'bg-[#121214] border-[#2C2C30]' : 'bg-[#F5F5F7] border-[#E5E5EA]'
                         }`}
                       >
-                        <option value="128kbps">128 kbps</option>
-                        <option value="320kbps">320 kbps</option>
-                        <option value="16-Bit 44.1kHz">16-Bit / 44.1 kHz</option>
-                        <option value="24-Bit 96kHz Lossless">24-Bit / 96 kHz Lossless</option>
+                        {(OUTPUT_QUALITY_OPTIONS[settings.defaultFormat] || OUTPUT_QUALITY_OPTIONS.MP3).map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
                       </select>
                     </div>
                   </div>
 
-                  <div className="flex items-center justify-between pt-2">
-                    <div>
-                      <p className="text-sm font-semibold">Simultaneous Downloads Limit</p>
-                      <p className={`text-xs ${textMuted}`}>
-                        Maximum concurrent transfers in the Download Queue (1–4).
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      {[1, 2, 3, 4].map((num) => (
-                        <button
-                          key={num}
-                          onClick={() =>
-                            setSettings({ ...settings, concurrentDownloads: num })
-                          }
-                          className={`w-8 h-8 rounded-xl text-xs font-bold border transition-all ${
-                            settings.concurrentDownloads === num
-                              ? 'bg-[#E84159] text-white border-[#E84159]'
-                              : bgSurface
-                          }`}
-                        >
-                          {num}
-                        </button>
-                      ))}
-                    </div>
+                  <div className="rounded-2xl bg-[#F5F5F7] dark:bg-[#121214] px-4 py-3 text-xs">
+                    Downloads are processed one at a time so progress and browser saves stay reliable.
                   </div>
                 </div>
 
-                {/* Firebase Cloud Sync & Reset */}
+                {/* Supabase Cloud Sync & Reset */}
                 <div className={`p-6 rounded-3xl border ${bgSurface} space-y-4`}>
                   <h3 className="font-bold text-base flex items-center gap-2">
                     <HardDrive className="w-4 h-4 text-[#E84159]" />
-                    <span>Firebase Cloud Sync</span>
+                    <span>Supabase Cloud Sync</span>
                   </h3>
 
                   <div className="pt-2 flex flex-wrap items-center justify-between gap-3">
                     <p className={`text-xs ${textMuted}`}>
-                      Your library, downloads, history, and settings sync to your account. Audio files are kept in your local Music_Downloads folder.
+                      Your library, downloads, history, and settings sync to your account. Audio files are saved to your browser and backed up in Supabase Storage for playback.
                     </p>
                     <button
                       onClick={handleResetCloudData}
                       className="px-4 py-2 rounded-xl border border-[#E84159] text-[#E84159] text-xs font-bold hover:bg-[#E84159] hover:text-white transition-colors"
                     >
-                      Reset Demo Data
+                      Reset Cloud Data
                     </button>
                   </div>
                 </div>
@@ -2304,7 +2468,9 @@ export default function App() {
               title={isPlaying ? 'Pause' : 'Play'}
               className="w-10 h-10 rounded-full bg-[#E84159] text-white flex items-center justify-center shadow-lg shadow-[#E84159]/30 hover:scale-105 transition-transform"
             >
-              {isPlaying ? (
+              {playbackLoading ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : isPlaying ? (
                 <Pause className="w-4 h-4" />
               ) : (
                 <Play className="w-4 h-4 fill-current ml-0.5" />
