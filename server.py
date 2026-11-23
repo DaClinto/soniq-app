@@ -148,6 +148,7 @@ YDL_BASE_OPTS = {
     "noplaylist": True,
     "skip_download": True,
     "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
+    "extractor_args": {"youtube": {"player_client": ["android", "ios", "tv", "web_embedded", "web"]}},
 }
 
 DEFAULT_THUMB = "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=400&q=80"
