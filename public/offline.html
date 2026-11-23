@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>SONIQ — You're offline</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      min-height: 100vh; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 1rem;
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0b0b12; color: #f4f4f8; text-align: center; padding: 2rem;
+    }
+    h1 { font-size: 1.75rem; font-weight: 700; }
+    p { color: #a1a1aa; max-width: 320px; line-height: 1.5; }
+    button {
+      margin-top: 1rem; padding: 0.75rem 1.75rem; border: none; border-radius: 9999px;
+      background: linear-gradient(135deg, #7c3aed, #ec4899); color: #fff;
+      font-weight: 600; cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <h1>You're offline</h1>
+  <p>SONIQ needs a connection to search and download music. Reconnect and try again.</p>
+  <button onclick="location.reload()">Retry</button>
+</body>
+</html>

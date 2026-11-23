@@ -1,0 +1,32 @@
+{
+  "name": "SONIQ — AI Music Downloader",
+  "short_name": "SONIQ",
+  "description": "Search YouTube, preview tracks instantly, and download MP3/WAV/FLAC to your device.",
+  "start_url": "/soniq-app/",
+  "scope": "/soniq-app/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b0b12",
+  "theme_color": "#7c3aed",
+  "categories": ["music", "entertainment", "utilities"],
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
