@@ -243,6 +243,7 @@ def ytdlp_download_source(url, out_dir, video_id=""):
 def download_audio(song_query, download_folder=DOWNLOAD_FOLDER, audio_format="MP3", quality="320kbps"):
     print(f"\n[Download] Request received for: {song_query} ({audio_format}/{quality})")
     os.makedirs(download_folder, exist_ok=True)
+    download_audio.last_error = ""
     temp_dir = None
     try:
         info, err = ytdlp_extract_info(song_query)
@@ -304,6 +305,7 @@ def download_audio(song_query, download_folder=DOWNLOAD_FOLDER, audio_format="MP
             "previewUrl": stream_url,
         }
     except Exception as e:
+        download_audio.last_error = f"{type(e).__name__}: {e}"
         print(f"[Download Error] {e}")
         return None
     finally:
@@ -595,7 +597,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self._send_cors()
                 self.end_headers()
-                self.wfile.write(json.dumps({"success": False, "error": "Download failed"}).encode("utf-8"))
+                self.wfile.write(json.dumps({"success": False, "error": "Download failed", "detail": getattr(download_audio, "last_error", "")}).encode("utf-8"))
             return
 
         self.send_error(404, "Endpoint Not Found")
