@@ -348,6 +348,12 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Range")
         self.send_header("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges")
 
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._send_cors()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _get_byte_range(self, file_size):
         range_header = self.headers.get("Range")
         if not range_header:
