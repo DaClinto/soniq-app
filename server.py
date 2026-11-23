@@ -497,6 +497,28 @@ class APIHandler(BaseHTTPRequestHandler):
             self._serve_audio_file(playable_path, head_only)
             return
 
+        elif parsed.path == "/api/search":
+            params = urllib.parse.parse_qs(parsed.query)
+            query = params.get("q", params.get("query", [None]))[0]
+            if not query:
+                self.send_error(400, "Missing query")
+                return
+            print(f"[Search] Query: {query}")
+            info = get_youtube_info(query)
+            if info:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self._send_cors()
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "data": info}).encode("utf-8"))
+            else:
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self._send_cors()
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "No results or search failed"}).encode("utf-8"))
+            return
+
         self.send_error(404, "Endpoint Not Found")
 
     def do_POST(self):
