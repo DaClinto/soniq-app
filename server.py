@@ -1,5 +1,6 @@
 import os
 import sys
+import asyncio
 import json
 import hashlib
 import mimetypes
@@ -14,6 +15,11 @@ import urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import imageio_ffmpeg
 import yt_dlp
+
+try:
+    from spotapi import Public as SpotifyPublic
+except Exception:
+    SpotifyPublic = None
 
 PORT = int(os.environ.get("PORT", "5001"))
 DOWNLOAD_FOLDER = os.path.join(os.path.expanduser("~"), "Music_Downloads")
@@ -594,6 +600,54 @@ def download_video(query, quality="720"):
         return None
 
 
+def spotify_search(query, n=10):
+    """Fast Spotify metadata via SpotAPI (no API key) — instant artwork/details
+    while yt-dlp resolves the actual audio."""
+    query = (query or "").strip()
+    if not query or SpotifyPublic is None:
+        return []
+
+    async def _search():
+        result = await SpotifyPublic.search(query, limit=n)
+        return list(result.tracks or [])
+
+    try:
+        tracks = asyncio.run(_search())
+    except Exception as e:
+        print(f"[Spotify Error] {e}")
+        return []
+
+    out = []
+    for t in tracks:
+        try:
+            artists = ", ".join(
+                a.profile.name
+                for a in (getattr(t.artists, "items", None) or [])
+                if getattr(getattr(a, "profile", None), "name", None)
+            )
+            album = getattr(getattr(t, "album_of_track", None), "name", "") or ""
+            ms = int(getattr(getattr(t, "duration", None), "total_milliseconds", 0) or 0)
+            secs = ms // 1000
+            sources = getattr(getattr(getattr(t, "album_of_track", None), "cover_art", None), "sources", None) or []
+            artwork = ""
+            if sources:
+                artwork = getattr(max(sources, key=lambda s: getattr(s, "width", 0) or 0), "url", "") or ""
+            out.append({
+                "id": f"sp-{getattr(t, 'id', '')}",
+                "title": getattr(t, "name", "") or "",
+                "artist": artists or "Unknown artist",
+                "album": album,
+                "duration": f"{secs // 60}:{secs % 60:02d}",
+                "durationSeconds": secs,
+                "artwork": artwork or DEFAULT_THUMB,
+                "source": "spotify",
+                "needsResolve": True,
+            })
+        except Exception:
+            continue
+    return out[:n]
+
+
 def scan_video_library():
     videos = []
     if not os.path.exists(VIDEO_FOLDER):
@@ -898,6 +952,26 @@ class APIHandler(BaseHTTPRequestHandler):
             self._send_cors()
             self.end_headers()
             self.wfile.write(json.dumps({"success": bool(videos), "videos": videos, "error": "" if videos else "No results"}).encode("utf-8"))
+            return
+
+        elif parsed.path == "/api/spotify_search":
+            params = urllib.parse.parse_qs(parsed.query)
+            query = params.get("q", params.get("query", [None]))[0]
+            try:
+                n = max(1, min(int(params.get("n", ["10"])[0] or 10), 20))
+            except (TypeError, ValueError):
+                n = 10
+            if not query:
+                self.send_error(400, "Missing query")
+                return
+            print(f"[SpotifySearch] Query: {query} (n={n})")
+            tracks = spotify_search(query, n)
+            self.send_response(200 if tracks else 404)
+            self.send_header("Content-Type", "application/json")
+            self._send_cors()
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(json.dumps({"success": bool(tracks), "tracks": tracks, "error": "" if tracks else "No results"}).encode("utf-8"))
             return
 
         self.send_error(404, "Endpoint Not Found")
