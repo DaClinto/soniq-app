@@ -17,10 +17,13 @@ import yt_dlp
 
 PORT = int(os.environ.get("PORT", "5001"))
 DOWNLOAD_FOLDER = os.path.join(os.path.expanduser("~"), "Music_Downloads")
+VIDEO_FOLDER = os.path.join(os.path.expanduser("~"), "Video_Downloads")
 CACHE_FOLDER = os.path.join(tempfile.gettempdir(), "soniq-audio-cache")
 CONVERSION_LOCK = threading.Lock()
 if not os.path.exists(DOWNLOAD_FOLDER):
     os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+if not os.path.exists(VIDEO_FOLDER):
+    os.makedirs(VIDEO_FOLDER, exist_ok=True)
 
 print(f"[SONIQ Server] Running on http://127.0.0.1:{PORT}")
 print(f"[SONIQ Server] Music Downloads Folder: {DOWNLOAD_FOLDER}")
@@ -46,6 +49,18 @@ def audio_content_type(file_path):
     if header.startswith(b"fLaC"):
         return "audio/flac"
     return mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+
+
+def video_content_type(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    return {
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+        ".mkv": "video/x-matroska",
+        ".mov": "video/quicktime",
+        ".avi": "video/x-msvideo",
+        ".m4v": "video/x-m4v",
+    }.get(ext) or mimetypes.guess_type(file_path)[0] or "application/octet-stream"
 
 def audio_file_extension(stream):
     subtype = (getattr(stream, "subtype", "") or "").lower()
@@ -438,6 +453,174 @@ def scan_local_library():
             })
     return tracks
 
+
+def ytdlp_extract_video(query):
+    """Extract video info without the 'Audio' search suffix used for music."""
+    is_url = "youtube.com" in query or "youtu.be" in query
+    opts = dict(YDL_BASE_OPTS)
+    opts["extract_flat"] = not is_url
+    opts["default_search"] = "ytsearch5"
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        if is_url:
+            return ydl.extract_info(query, download=False), None
+        result = ydl.extract_info(f"ytsearch5:{query}", download=False)
+    entries = (result or {}).get("entries") or []
+    for entry in entries:
+        if entry and entry.get("id"):
+            return entry, None
+    return None, "No results found"
+
+
+def ytdlp_search_videos(query, n=8):
+    query = (query or "").strip()
+    if not query:
+        return []
+    is_url = "youtube.com" in query or "youtu.be" in query
+    opts = dict(YDL_BASE_OPTS)
+    opts["extract_flat"] = True
+    opts["default_search"] = f"ytsearch{n}"
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            if is_url:
+                result = ydl.extract_info(query, download=False)
+                entries = [result] if result else []
+            else:
+                result = ydl.extract_info(f"ytsearch{n}:{query}", download=False)
+                entries = (result or {}).get("entries") or []
+    except Exception as e:
+        print(f"[VideoSearch Error] {e}")
+        return []
+    videos = []
+    for entry in entries:
+        if not entry or not entry.get("id"):
+            continue
+        info = build_youtube_track_info(entry, query)
+        info["isVideo"] = True
+        info["previewUrl"] = None
+        videos.append(info)
+    return videos
+
+
+def download_video(query, quality="720"):
+    """Download a YouTube video as mp4 (best quality up to `quality`p)."""
+    print(f"\n[VideoDownload] Request received for: {query} ({quality}p)")
+    os.makedirs(VIDEO_FOLDER, exist_ok=True)
+    download_video.last_error = ""
+    try:
+        info, err = ytdlp_extract_video(query)
+        if not info:
+            download_video.last_error = err or "No results found"
+            return None
+
+        video_id = info.get("id") or ""
+        title = info.get("title") or "YouTube Video"
+        watch_url = info.get("webpage_url") or (f"https://www.youtube.com/watch?v={video_id}" if video_id else query)
+        try:
+            height = max(144, min(int(str(quality).replace("p", "") or 720), 2160))
+        except (TypeError, ValueError):
+            height = 720
+        safe_title = sanitize_filename(title)
+        prefix = f"{safe_title}."
+        existing = next(
+            (n for n in os.listdir(VIDEO_FOLDER)
+             if n.startswith(prefix) and n.lower().endswith((".mp4", ".webm", ".mkv", ".mov"))),
+            None,
+        )
+        if existing:
+            file_path = os.path.join(VIDEO_FOLDER, existing)
+            print(f"[VideoDownload] Already downloaded: {file_path}")
+        else:
+            opts = dict(YDL_BASE_OPTS)
+            opts.update({
+                "format": (
+                    f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+                    f"bestvideo[height<={height}]+bestaudio/"
+                    f"best[height<={height}]/best"
+                ),
+                "outtmpl": os.path.join(VIDEO_FOLDER, "%(id)s.%(ext)s"),
+                "skip_download": False,
+                "merge_output_format": "mp4",
+            })
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([watch_url])
+            produced = None
+            for name in sorted(os.listdir(VIDEO_FOLDER)):
+                if video_id and name.startswith(f"{video_id}.") and not name.endswith((".part", ".ytdl", ".tmp")):
+                    produced = os.path.join(VIDEO_FOLDER, name)
+                    break
+            if not produced:
+                for name in sorted(os.listdir(VIDEO_FOLDER)):
+                    if name.startswith(prefix) and not name.endswith((".part", ".ytdl", ".tmp")):
+                        produced = os.path.join(VIDEO_FOLDER, name)
+                        break
+            if not produced:
+                raise RuntimeError("yt-dlp did not produce a video file")
+            ext = os.path.splitext(produced)[1].lower() or ".mp4"
+            file_path = os.path.join(VIDEO_FOLDER, f"{safe_title}{ext}")
+            if os.path.abspath(produced) != os.path.abspath(file_path):
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                os.replace(produced, file_path)
+            print(f"[VideoDownload] Successfully saved: {file_path}")
+
+        filename = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+        meta = build_youtube_track_info(info, query)
+        length = int(info.get("duration") or meta.get("durationSeconds") or 0)
+        return {
+            "success": True,
+            "id": f"vid-{abs(hash(filename))}",
+            "title": title,
+            "artist": meta["artist"],
+            "album": "YouTube Video",
+            "duration": meta["duration"],
+            "durationSeconds": length,
+            "artwork": meta["artwork"],
+            "filename": filename,
+            "file_path": file_path,
+            "size": f"{file_size / (1024 * 1024):.1f} MB",
+            "sizeBytes": file_size,
+            "format": "MP4",
+            "quality": f"{height}p",
+            "provider": "YouTube Video (yt-dlp)",
+            "isVideo": True,
+            "videoUrl": f"/api/video_file?file={urllib.parse.quote(filename)}",
+            "downloadUrl": f"/api/video_file?file={urllib.parse.quote(filename)}",
+            "previewUrl": None,
+        }
+    except Exception as e:
+        download_video.last_error = f"{type(e).__name__}: {e}"
+        print(f"[VideoDownload Error] {e}")
+        return None
+
+
+def scan_video_library():
+    videos = []
+    if not os.path.exists(VIDEO_FOLDER):
+        return videos
+    for f in sorted(os.listdir(VIDEO_FOLDER), key=lambda n: -os.path.getmtime(os.path.join(VIDEO_FOLDER, n))):
+        if f.lower().endswith((".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi")):
+            p = os.path.join(VIDEO_FOLDER, f)
+            size_mb = f"{os.path.getsize(p) / (1024 * 1024):.1f} MB"
+            name_no_ext = os.path.splitext(f)[0]
+            videos.append({
+                "id": f"vid-{abs(hash(f))}",
+                "title": name_no_ext,
+                "artist": "Downloaded Video",
+                "album": "Video_Downloads",
+                "artwork": DEFAULT_THUMB,
+                "duration": "Video",
+                "filename": f,
+                "size": size_mb,
+                "format": "MP4",
+                "isVideo": True,
+                "videoUrl": f"/api/video_file?file={urllib.parse.quote(f)}",
+                "downloadUrl": f"/api/video_file?file={urllib.parse.quote(f)}",
+                "previewUrl": None,
+            })
+    return videos
+
+
 class APIHandler(BaseHTTPRequestHandler):
     def _send_cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -483,7 +666,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self._send_cors()
         self.end_headers()
 
-    def _serve_audio_file(self, file_path, head_only=False):
+    def _serve_audio_file(self, file_path, head_only=False, content_type=None):
         file_size = os.path.getsize(file_path)
         try:
             start, end, is_partial = self._get_byte_range(file_size)
@@ -492,7 +675,7 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(206 if is_partial else 200)
-        self.send_header("Content-Type", audio_content_type(file_path))
+        self.send_header("Content-Type", content_type or audio_content_type(file_path))
         self.send_header("Content-Length", str(max(end - start + 1, 0)))
         self.send_header("Accept-Ranges", "bytes")
         if is_partial:
@@ -671,6 +854,52 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"success": False, "error": "No results or search failed", "detail": getattr(get_youtube_info, "last_error", "")}).encode("utf-8"))
             return
 
+        elif parsed.path == "/api/videos":
+            videos = scan_video_library()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._send_cors()
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(json.dumps({"success": True, "videos": videos}).encode("utf-8"))
+            return
+
+        elif parsed.path == "/api/video_file":
+            params = urllib.parse.parse_qs(parsed.query)
+            filename = os.path.basename(params.get("file", [None])[0] or "")
+            if not filename:
+                self.send_error(400, "Missing filename")
+                return
+            file_path = os.path.realpath(os.path.join(VIDEO_FOLDER, filename))
+            video_root = os.path.realpath(VIDEO_FOLDER)
+            if not file_path.startswith(video_root + os.sep):
+                self.send_error(400, "Invalid filename")
+                return
+            if not os.path.exists(file_path):
+                self.send_error(404, f"File not found: {filename}")
+                return
+            self._serve_audio_file(file_path, head_only, content_type=video_content_type(file_path))
+            return
+
+        elif parsed.path == "/api/video_search":
+            params = urllib.parse.parse_qs(parsed.query)
+            query = params.get("q", params.get("query", [None]))[0]
+            try:
+                n = max(1, min(int(params.get("n", ["8"])[0] or 8), 15))
+            except (TypeError, ValueError):
+                n = 8
+            if not query:
+                self.send_error(400, "Missing query")
+                return
+            print(f"[VideoSearch] Query: {query} (n={n})")
+            videos = ytdlp_search_videos(query, n)
+            self.send_response(200 if videos else 404)
+            self.send_header("Content-Type", "application/json")
+            self._send_cors()
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": bool(videos), "videos": videos, "error": "" if videos else "No results"}).encode("utf-8"))
+            return
+
         self.send_error(404, "Endpoint Not Found")
 
     def do_POST(self):
@@ -720,6 +949,23 @@ class APIHandler(BaseHTTPRequestHandler):
                 self._send_cors()
                 self.end_headers()
                 self.wfile.write(json.dumps({"success": False, "error": "Download failed", "detail": getattr(download_audio, "last_error", "")}).encode("utf-8"))
+            return
+
+        elif parsed.path == "/api/download_video":
+            query = data.get("query") or data.get("url") or ""
+            res = download_video(query, data.get("quality", "720"))
+            if res:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self._send_cors()
+                self.end_headers()
+                self.wfile.write(json.dumps(res).encode("utf-8"))
+            else:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self._send_cors()
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "Video download failed", "detail": getattr(download_video, "last_error", "")}).encode("utf-8"))
             return
 
         self.send_error(404, "Endpoint Not Found")
