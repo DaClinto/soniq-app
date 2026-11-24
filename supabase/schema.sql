@@ -78,15 +78,40 @@ on conflict (id) do update set public = true;
 drop policy if exists "Users can upload own avatar" on storage.objects;
 create policy "Users can upload own avatar"
   on storage.objects for insert to authenticated
-  with check (bucket_id = 'avatars' and (storage.foldername(name))[1] = 'users' and (storage.foldername(name))[2] = auth.uid()::text);
+  with check (
+    bucket_id = 'avatars'
+    and auth.uid() is not null
+    and name like 'users/' || auth.uid()::text || '/%'
+  );
 
 drop policy if exists "Users can update own avatar" on storage.objects;
 create policy "Users can update own avatar"
   on storage.objects for update to authenticated
-  using (bucket_id = 'avatars' and (storage.foldername(name))[1] = 'users' and (storage.foldername(name))[2] = auth.uid()::text)
-  with check (bucket_id = 'avatars' and (storage.foldername(name))[1] = 'users' and (storage.foldername(name))[2] = auth.uid()::text);
+  using (
+    bucket_id = 'avatars'
+    and auth.uid() is not null
+    and name like 'users/' || auth.uid()::text || '/%'
+  )
+  with check (
+    bucket_id = 'avatars'
+    and auth.uid() is not null
+    and name like 'users/' || auth.uid()::text || '/%'
+  );
 
 drop policy if exists "Users can delete own avatar" on storage.objects;
 create policy "Users can delete own avatar"
   on storage.objects for delete to authenticated
-  using (bucket_id = 'avatars' and (storage.foldername(name))[1] = 'users' and (storage.foldername(name))[2] = auth.uid()::text);
+  using (
+    bucket_id = 'avatars'
+    and auth.uid() is not null
+    and name like 'users/' || auth.uid()::text || '/%'
+  );
+
+drop policy if exists "Users can read own avatar" on storage.objects;
+create policy "Users can read own avatar"
+  on storage.objects for select to authenticated
+  using (
+    bucket_id = 'avatars'
+    and auth.uid() is not null
+    and name like 'users/' || auth.uid()::text || '/%'
+  );
