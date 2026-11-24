@@ -337,6 +337,30 @@ def download_audio(song_query, download_folder=DOWNLOAD_FOLDER, audio_format="MP
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+def ytdlp_direct_audio_url(video_id):
+    """Resolve the direct audio stream URL for a video — no download, fast."""
+    if not video_id or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        return ""
+    opts = dict(YDL_BASE_OPTS)
+    opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
+    opts["extract_flat"] = False
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+    except Exception as e:
+        print(f"[DirectURL Error] {e}")
+        return ""
+    if not info:
+        return ""
+    url = info.get("url")
+    if url:
+        return url
+    for f in reversed(info.get("formats") or []):
+        if f.get("url") and f.get("vcodec") == "none":
+            return f["url"]
+    return ""
+
+
 def ytdlp_search_multi(query, n=8):
     query = (query or "").strip()
     if not query:
@@ -590,6 +614,20 @@ class APIHandler(BaseHTTPRequestHandler):
                 return
 
             self._serve_audio_file(playable_path, head_only)
+            return
+
+        elif parsed.path == "/api/preview_url":
+            params = urllib.parse.parse_qs(parsed.query)
+            video_id = params.get("v", [None])[0]
+            if not video_id:
+                self.send_error(400, "Missing video id")
+                return
+            direct = ytdlp_direct_audio_url(video_id)
+            self.send_response(200 if direct else 404)
+            self.send_header("Content-Type", "application/json")
+            self._send_cors()
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": bool(direct), "url": direct}).encode("utf-8"))
             return
 
         elif parsed.path == "/api/search_multi":
