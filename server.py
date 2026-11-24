@@ -337,6 +337,33 @@ def download_audio(song_query, download_folder=DOWNLOAD_FOLDER, audio_format="MP
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+def ytdlp_search_multi(query, n=8):
+    query = (query or "").strip()
+    if not query:
+        return []
+    is_url = "youtube.com" in query or "youtu.be" in query
+    opts = dict(YDL_BASE_OPTS)
+    opts["extract_flat"] = True
+    opts["default_search"] = f"ytsearch{n}"
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            if is_url:
+                result = ydl.extract_info(query, download=False)
+                entries = [result] if result else []
+            else:
+                result = ydl.extract_info(f"ytsearch{n}:{query}", download=False)
+                entries = (result or {}).get("entries") or []
+    except Exception as e:
+        print(f"[MultiSearch Error] {e}")
+        return []
+    tracks = []
+    for entry in entries:
+        if not entry or not entry.get("id"):
+            continue
+        tracks.append(build_youtube_track_info(entry, query))
+    return tracks
+
+
 def ytdlp_download_preview(video_id, out_path):
     temp_dir = tempfile.mkdtemp(prefix="soniq-prev-")
     try:
@@ -563,6 +590,25 @@ class APIHandler(BaseHTTPRequestHandler):
                 return
 
             self._serve_audio_file(playable_path, head_only)
+            return
+
+        elif parsed.path == "/api/search_multi":
+            params = urllib.parse.parse_qs(parsed.query)
+            query = params.get("q", params.get("query", [None]))[0]
+            try:
+                n = max(1, min(int(params.get("n", ["8"])[0] or 8), 15))
+            except (TypeError, ValueError):
+                n = 8
+            if not query:
+                self.send_error(400, "Missing query")
+                return
+            print(f"[MultiSearch] Query: {query} (n={n})")
+            tracks = ytdlp_search_multi(query, n)
+            self.send_response(200 if tracks else 404)
+            self.send_header("Content-Type", "application/json")
+            self._send_cors()
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": bool(tracks), "tracks": tracks, "error": "" if tracks else "No results"}).encode("utf-8"))
             return
 
         elif parsed.path == "/api/search":
