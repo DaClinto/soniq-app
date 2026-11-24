@@ -187,20 +187,54 @@ YDL_BASE_OPTS = {
 
 DEFAULT_THUMB = "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=400&q=80"
 
+# Music-only filtering for song searches — keeps podcasts, interviews,
+# reactions, explainers, DJ sets and other non-music videos out of results.
+NON_MUSIC_RE = re.compile(
+    r"(podcast|interview|reaction|tutorial|documentary|vlog|"
+    r"\bexplained\b|\bexplainer\b|story behind|behind the scenes|"
+    r"\btrailer\b|news (report|segment)|\bdebate\b|\bpanel\b|"
+    r"#shorts|\bshorts\b|full episode|episode #|"
+    r"\bdj\s+(mix|set)\b|album mix|"
+    r"\b1 hour\b|\bhour loop\b)",
+    re.IGNORECASE,
+)
+MAX_SONG_SECONDS = 1200  # 20 min — longer uploads are sets/podcasts/lectures
+
+
+def is_music_entry(entry):
+    """True if a flat yt-dlp search entry looks like a playable song."""
+    if not entry or not entry.get("id"):
+        return False
+    ie = entry.get("ie_key")
+    if ie and ie != "Youtube":
+        return False
+    dur = entry.get("duration")
+    if isinstance(dur, (int, float)) and dur > MAX_SONG_SECONDS:
+        return False
+    text = " ".join(str(entry.get(k) or "") for k in ("title", "uploader", "channel"))
+    return not NON_MUSIC_RE.search(text)
+
 
 def ytdlp_extract_info(query):
     is_url = "youtube.com" in query or "youtu.be" in query
     opts = dict(YDL_BASE_OPTS)
     opts["extract_flat"] = not is_url
-    opts["default_search"] = "ytsearch5"
+    opts["default_search"] = "ytsearch8"
     with yt_dlp.YoutubeDL(opts) as ydl:
         if is_url:
             return ydl.extract_info(query, download=False), None
-        result = ydl.extract_info(f"ytsearch5:{query} Audio", download=False)
+        result = ydl.extract_info(f"ytsearch8:{query} Audio", download=False)
     entries = (result or {}).get("entries") or []
+    fallback = None
     for entry in entries:
-        if entry and entry.get("id"):
+        if not entry or not entry.get("id"):
+            continue
+        if fallback is None:
+            fallback = entry
+        if is_music_entry(entry):
             return entry, None
+    if fallback is not None:
+        return fallback, None
     return None, "No results found"
 
 
@@ -387,23 +421,26 @@ def ytdlp_search_multi(query, n=8):
     if not query:
         return []
     is_url = "youtube.com" in query or "youtu.be" in query
+    fetch_n = min(max(n * 2, n + 4), 20)
     opts = dict(YDL_BASE_OPTS)
     opts["extract_flat"] = True
-    opts["default_search"] = f"ytsearch{n}"
+    opts["default_search"] = f"ytsearch{fetch_n}"
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             if is_url:
                 result = ydl.extract_info(query, download=False)
                 entries = [result] if result else []
             else:
-                result = ydl.extract_info(f"ytsearch{n}:{query}", download=False)
+                result = ydl.extract_info(f"ytsearch{fetch_n}:{query}", download=False)
                 entries = (result or {}).get("entries") or []
     except Exception as e:
         print(f"[MultiSearch Error] {e}")
         return []
     tracks = []
     for entry in entries:
-        if not entry or not entry.get("id"):
+        if len(tracks) >= n:
+            break
+        if not is_music_entry(entry):
             continue
         tracks.append(build_youtube_track_info(entry, query))
     return tracks
