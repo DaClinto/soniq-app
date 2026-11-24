@@ -648,6 +648,51 @@ def spotify_search(query, n=10):
     return out[:n]
 
 
+ENTITY_IMAGE_CACHE = {}
+
+
+def _largest_source_url(sources):
+    if not sources:
+        return ""
+    return getattr(max(sources, key=lambda s: getattr(s, "width", 0) or 0), "url", "") or ""
+
+
+async def _entity_image_one(name):
+    """Artist avatar first, then top track's album art as fallback."""
+    r = await SpotifyPublic.search(name, limit=3)
+    artists = getattr(r, "artists", None) or []
+    for a in artists[:1]:
+        url = _largest_source_url(
+            getattr(getattr(getattr(a, "visuals", None), "avatar_image", None), "sources", None)
+        )
+        if url:
+            return name, url
+    tracks = getattr(r, "tracks", None) or []
+    for t in tracks[:2]:
+        url = _largest_source_url(
+            getattr(getattr(getattr(t, "album_of_track", None), "cover_art", None), "sources", None)
+        )
+        if url:
+            return name, url
+    return name, ""
+
+
+def entity_images(names):
+    """Resolve display images for artist/station names via SpotAPI. Cached."""
+    if SpotifyPublic is None:
+        return {}
+    missing = [n for n in names if n not in ENTITY_IMAGE_CACHE]
+    if missing:
+        async def _fetch():
+            return await asyncio.gather(*[_entity_image_one(n) for n in missing])
+        try:
+            for name, url in asyncio.run(_fetch()):
+                ENTITY_IMAGE_CACHE[name] = url
+        except Exception as e:
+            print(f"[EntityImage Error] {e}")
+    return {n: ENTITY_IMAGE_CACHE[n] for n in names if ENTITY_IMAGE_CACHE.get(n)}
+
+
 def scan_video_library():
     videos = []
     if not os.path.exists(VIDEO_FOLDER):
@@ -972,6 +1017,21 @@ class APIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             if not head_only:
                 self.wfile.write(json.dumps({"success": bool(tracks), "tracks": tracks, "error": "" if tracks else "No results"}).encode("utf-8"))
+            return
+
+        elif parsed.path == "/api/entity_images":
+            params = urllib.parse.parse_qs(parsed.query)
+            names = [n.strip() for n in (params.get("names", [""])[0] or "").split(",") if n.strip()][:20]
+            if not names:
+                self.send_error(400, "Missing names")
+                return
+            images = entity_images(names)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._send_cors()
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(json.dumps({"success": True, "images": images}).encode("utf-8"))
             return
 
         self.send_error(404, "Endpoint Not Found")
