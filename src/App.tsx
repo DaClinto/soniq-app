@@ -50,18 +50,24 @@ import {
 type AuthUser = { id: string; email?: string | null };
 
 const SONIQ_API_URL = (import.meta.env.VITE_SONIQ_API_URL || '').replace(/\/$/, '');
+const SONIQ_API_KEY = (import.meta.env.VITE_SONIQ_API_KEY || '') as string;
+
+function withApiKey(url: string): string {
+  if (!SONIQ_API_KEY || !url.includes('/api/')) return url;
+  return url + (url.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(SONIQ_API_KEY);
+}
 
 function apiUrl(path) {
-  if (SONIQ_API_URL) return `${SONIQ_API_URL}${path}`;
+  if (SONIQ_API_URL) return withApiKey(`${SONIQ_API_URL}${path}`);
   if (import.meta.env.PROD) {
     throw new Error('Search and download require VITE_SONIQ_API_URL to point to a running Soniq API server.');
   }
-  return path;
+  return withApiKey(path);
 }
 
 function resolveApiUrl(url) {
   if (!url || !url.startsWith('/')) return url;
-  return SONIQ_API_URL ? `${SONIQ_API_URL}${url}` : url;
+  return withApiKey(SONIQ_API_URL ? `${SONIQ_API_URL}${url}` : url);
 }
 
 const OUTPUT_FORMATS = ['MP3', 'AAC', 'WAV', 'FLAC'];
