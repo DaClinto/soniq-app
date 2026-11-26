@@ -17,11 +17,18 @@ import imageio_ffmpeg
 import yt_dlp
 
 try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+try:
     from spotapi import Public as SpotifyPublic
 except Exception:
     SpotifyPublic = None
 
 PORT = int(os.environ.get("PORT", "5001"))
+API_KEY = os.environ.get("SONIQ_API_KEY", "").strip()  # empty = no auth (local dev)
 DOWNLOAD_FOLDER = os.path.join(os.path.expanduser("~"), "Music_Downloads")
 VIDEO_FOLDER = os.path.join(os.path.expanduser("~"), "Video_Downloads")
 CACHE_FOLDER = os.path.join(tempfile.gettempdir(), "soniq-audio-cache")
@@ -787,6 +794,23 @@ def scan_video_library():
 
 
 class APIHandler(BaseHTTPRequestHandler):
+    def _authorized(self, parsed):
+        # /api/status stays open for health checks; everything else needs ?key= when API_KEY is set
+        if not API_KEY or parsed.path == "/api/status":
+            return True
+        params = urllib.parse.parse_qs(parsed.query)
+        return params.get("key", [""])[0] == API_KEY
+
+    def _send_unauthorized(self):
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self._send_cors()
+        self.end_headers()
+        try:
+            self.wfile.write(json.dumps({"success": False, "error": "Unauthorized"}).encode("utf-8"))
+        except Exception:
+            pass
+
     def _send_cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
@@ -872,6 +896,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self, head_only=False):
         parsed = urllib.parse.urlparse(self.path)
+        if not self._authorized(parsed):
+            self._send_unauthorized()
+            return
 
         if parsed.path == "/api/status":
             self.send_response(200)
@@ -1123,6 +1150,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
+        if not self._authorized(parsed):
+            self._send_unauthorized()
+            return
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
         try:
