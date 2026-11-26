@@ -9,3 +9,5 @@ venv/
 !.env.example
 google-services.json
 GoogleService-Info.plist
+server.log
+tunnel.log
